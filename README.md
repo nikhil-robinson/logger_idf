@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/ESP--IDF-V5.2%2B-blue?&logo=espressif" alt="ESP-IDF">
-  <img src="https://img.shields.io/badge/License-MIT-green?" alt="License">
+  <img src="https://img.shields.io/badge/License-BSD3-green?" alt="License">
   <img src="https://img.shields.io/badge/Version-1.0.0-orange?" alt="Version">
 </p>
 
