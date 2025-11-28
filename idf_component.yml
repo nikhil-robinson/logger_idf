@@ -1,0 +1,9 @@
+version: "1.0.0"
+description: Blackbox logger library for ESP-IDF with binary format, lock-free ring buffer, optional AES encryption, and automatic file rotation.
+url: https://github.com/nikhil-robinson/logger_idf
+repository: https://github.com/nikhil-robinson/logger_idf.git
+documentation: https://github.com/nikhil-robinson/logger_idf
+issues: https://github.com/nikhil-robinson/logger_idf/issues
+
+dependencies:
+  idf: ">=4.4"
