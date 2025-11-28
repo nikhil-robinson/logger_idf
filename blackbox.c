@@ -80,18 +80,10 @@ typedef struct {
     blackbox_stats_t stats;
     SemaphoreHandle_t stats_mutex;
     
-    /* Cached file hash to avoid repeated computation */
-    uint32_t cached_file_hash;
-    const char* cached_file_path;
-    
-    /* Cached tag hash to avoid repeated computation */
-    uint32_t cached_tag_hash;
-    const char* cached_tag_ptr;
-    
-    /* Runtime settings */
-    blackbox_level_t min_level;
-    bool console_output;
-    bool file_output;
+    /* Runtime settings (atomic for thread-safe access from multiple cores) */
+    atomic_int min_level;
+    atomic_bool console_output;
+    atomic_bool file_output;
 } blackbox_state_t;
 
 static blackbox_state_t s_blackbox = {0};
@@ -116,31 +108,20 @@ static size_t build_blackbox_packet(blackbox_packet_t* packet, blackbox_level_t 
  ******************************************************************************/
 
 /**
- * @brief Get cached or compute file hash (reduces repeated hashing)
+ * @brief Compute file hash (no caching to avoid data races in concurrent access)
+ * 
  */
-static inline IRAM_ATTR uint32_t get_file_hash(const char* file)
+static inline uint32_t get_file_hash(const char* file)
 {
-    if (s_blackbox.cached_file_path == file) {
-        return s_blackbox.cached_file_hash;
-    }
-    uint32_t hash = blackbox_hash_string(file);
-    s_blackbox.cached_file_path = file;
-    s_blackbox.cached_file_hash = hash;
-    return hash;
+    return blackbox_hash_string(file);
 }
 
 /**
- * @brief Get cached or compute tag hash (reduces repeated hashing)
+ * @brief Compute tag hash (no caching to avoid data races in concurrent access)
  */
-static inline IRAM_ATTR uint32_t get_tag_hash(const char* tag)
+static inline uint32_t get_tag_hash(const char* tag)
 {
-    if (s_blackbox.cached_tag_ptr == tag) {
-        return s_blackbox.cached_tag_hash;
-    }
-    uint32_t hash = blackbox_hash_string(tag);
-    s_blackbox.cached_tag_ptr = tag;
-    s_blackbox.cached_tag_hash = hash;
-    return hash;
+    return blackbox_hash_string(tag);
 }
 
 /*******************************************************************************
@@ -153,7 +134,7 @@ IRAM_ATTR uint32_t blackbox_hash_string(const char* str)
         return 0;
     }
     
-    /* FNV-1a hash - optimized for speed */
+    /* FNV-1a hash*/
     uint32_t hash = 2166136261u;
     const uint8_t* p = (const uint8_t*)str;
     while (*p) {
@@ -242,10 +223,10 @@ esp_err_t blackbox_init(const blackbox_config_t* config)
         s_blackbox.config.file_size_limit = BLACKBOX_LOG_DEFAULT_FILE_SIZE_LIMIT;
     }
     
-    /* Initialize runtime settings */
-    s_blackbox.min_level = config->min_level;
-    s_blackbox.console_output = config->console_output;
-    s_blackbox.file_output = config->file_output;
+    /* Initialize runtime settings (atomic for thread-safe access) */
+    atomic_store(&s_blackbox.min_level, (int)config->min_level);
+    atomic_store(&s_blackbox.console_output, config->console_output);
+    atomic_store(&s_blackbox.file_output, config->file_output);
     
     /* Create ring buffer */
     s_blackbox.ring_buffer = xRingbufferCreate(s_blackbox.config.buffer_size, RINGBUF_TYPE_NOSPLIT);
@@ -305,14 +286,6 @@ esp_err_t blackbox_init(const blackbox_config_t* config)
     memset(&s_blackbox.stats, 0, sizeof(blackbox_stats_t));
     atomic_store(&s_blackbox.messages_logged, 0);
     atomic_store(&s_blackbox.messages_dropped, 0);
-    
-    /* Initialize file hash cache */
-    s_blackbox.cached_file_path = NULL;
-    s_blackbox.cached_file_hash = 0;
-    
-    /* Initialize tag hash cache */
-    s_blackbox.cached_tag_ptr = NULL;
-    s_blackbox.cached_tag_hash = 0;
     
     /* Initialize file management */
     s_blackbox.current_file = NULL;
@@ -397,7 +370,14 @@ bool blackbox_is_initialized(void)
  * Core Logging Functions
  ******************************************************************************/
 
-static IRAM_ATTR size_t build_blackbox_packet(blackbox_packet_t* packet, blackbox_level_t level,
+/**
+ * @brief Build a log packet (not IRAM-safe due to vsnprintf usage)
+ * 
+ * Note: IRAM_ATTR was removed because this function calls vsnprintf which
+ * is not IRAM-safe when the flash cache is disabled (e.g., from high-priority
+ * ISRs or during panic handling).
+ */
+static size_t build_blackbox_packet(blackbox_packet_t* packet, blackbox_level_t level,
                                 const char* tag, const char* file, uint32_t line,
                                 const char* fmt, va_list args)
 {
@@ -429,7 +409,14 @@ static IRAM_ATTR size_t build_blackbox_packet(blackbox_packet_t* packet, blackbo
     return sizeof(blackbox_header_t) + payload_len;
 }
 
-void IRAM_ATTR blackbox_log(blackbox_level_t level, const char* tag, const char* file,
+/**
+ * @brief Log a message with the given level, tag, file, and line
+ * 
+ * Note: IRAM_ATTR was removed because this function calls vsnprintf, ESP_LOGx,
+ * and ring buffer API which are not IRAM-safe when the flash cache is disabled.
+ * Do not call from ISRs or during panic handling.
+ */
+void blackbox_log(blackbox_level_t level, const char* tag, const char* file,
               uint32_t line, const char* fmt, ...)
 {
     /* Early exit checks - keep these at the top for branch prediction */
@@ -437,7 +424,8 @@ void IRAM_ATTR blackbox_log(blackbox_level_t level, const char* tag, const char*
         return;
     }
     
-    if (level > s_blackbox.min_level || level == BLACKBOX_LOG_LEVEL_NONE) {
+    blackbox_level_t current_min_level = (blackbox_level_t)atomic_load(&s_blackbox.min_level);
+    if (level > current_min_level || level == BLACKBOX_LOG_LEVEL_NONE) {
         return;
     }
     
@@ -450,25 +438,34 @@ void IRAM_ATTR blackbox_log(blackbox_level_t level, const char* tag, const char*
     va_end(args);
     
     /* Console output (if enabled) */
-    if (s_blackbox.console_output) {
+    if (atomic_load(&s_blackbox.console_output)) {
         console_output(level, tag, packet.payload);
     }
     
     /* File output - push to ring buffer (lock-free) */
-    if (s_blackbox.file_output && s_blackbox.ring_buffer != NULL) {
+    if (atomic_load(&s_blackbox.file_output) && s_blackbox.ring_buffer != NULL) {
         /* Non-blocking send to ring buffer */
         BaseType_t result = xRingbufferSend(s_blackbox.ring_buffer, &packet, packet_size, 0);
         
         /* Atomic stats update - no mutex needed! */
         if (result == pdTRUE) {
             atomic_fetch_add(&s_blackbox.messages_logged, 1);
+            /* Signal writer task to process new data promptly */
+            xSemaphoreGive(s_blackbox.flush_sem);
         } else {
             atomic_fetch_add(&s_blackbox.messages_dropped, 1);
         }
     }
 }
 
-void IRAM_ATTR blackbox_log_va(blackbox_level_t level, const char* tag, const char* file,
+/**
+ * @brief Log a message with the given level, tag, file, line, and va_list
+ * 
+ * Note: IRAM_ATTR was removed because this function calls vsnprintf, ESP_LOGx,
+ * and ring buffer API which are not IRAM-safe when the flash cache is disabled.
+ * Do not call from ISRs or during panic handling.
+ */
+void blackbox_log_va(blackbox_level_t level, const char* tag, const char* file,
                  uint32_t line, const char* fmt, va_list args)
 {
     /* Early exit checks - keep these at the top for branch prediction */
@@ -476,7 +473,8 @@ void IRAM_ATTR blackbox_log_va(blackbox_level_t level, const char* tag, const ch
         return;
     }
     
-    if (level > s_blackbox.min_level || level == BLACKBOX_LOG_LEVEL_NONE) {
+    blackbox_level_t current_min_level = (blackbox_level_t)atomic_load(&s_blackbox.min_level);
+    if (level > current_min_level || level == BLACKBOX_LOG_LEVEL_NONE) {
         return;
     }
     
@@ -486,18 +484,20 @@ void IRAM_ATTR blackbox_log_va(blackbox_level_t level, const char* tag, const ch
     size_t packet_size = build_blackbox_packet(&packet, level, tag, file, line, fmt, args);
     
     /* Console output (if enabled) */
-    if (s_blackbox.console_output) {
+    if (atomic_load(&s_blackbox.console_output)) {
         console_output(level, tag, packet.payload);
     }
     
     /* File output - push to ring buffer (lock-free) */
-    if (s_blackbox.file_output && s_blackbox.ring_buffer != NULL) {
+    if (atomic_load(&s_blackbox.file_output) && s_blackbox.ring_buffer != NULL) {
         /* Non-blocking send to ring buffer */
         BaseType_t result = xRingbufferSend(s_blackbox.ring_buffer, &packet, packet_size, 0);
         
         /* Atomic stats update - no mutex needed! */
         if (result == pdTRUE) {
             atomic_fetch_add(&s_blackbox.messages_logged, 1);
+            /* Signal writer task to process new data promptly */
+            xSemaphoreGive(s_blackbox.flush_sem);
         } else {
             atomic_fetch_add(&s_blackbox.messages_dropped, 1);
         }
@@ -807,13 +807,13 @@ esp_err_t blackbox_set_level(blackbox_level_t level)
         return ESP_ERR_INVALID_STATE;
     }
     
-    s_blackbox.min_level = level;
+    atomic_store(&s_blackbox.min_level, (int)level);
     return ESP_OK;
 }
 
 blackbox_level_t blackbox_get_level(void)
 {
-    return s_blackbox.min_level;
+    return (blackbox_level_t)atomic_load(&s_blackbox.min_level);
 }
 
 esp_err_t blackbox_set_console_output(bool enable)
@@ -822,7 +822,7 @@ esp_err_t blackbox_set_console_output(bool enable)
         return ESP_ERR_INVALID_STATE;
     }
     
-    s_blackbox.console_output = enable;
+    atomic_store(&s_blackbox.console_output, enable);
     return ESP_OK;
 }
 
@@ -832,7 +832,7 @@ esp_err_t blackbox_set_file_output(bool enable)
         return ESP_ERR_INVALID_STATE;
     }
     
-    s_blackbox.file_output = enable;
+    atomic_store(&s_blackbox.file_output, enable);
     return ESP_OK;
 }
 

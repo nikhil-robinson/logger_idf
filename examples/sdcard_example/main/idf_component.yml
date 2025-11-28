@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=4.4"
+  nikhil-robinson/blackbox:
+    version: "*"
+    git: https://github.com/nikhil-robinson/blackbox.git
