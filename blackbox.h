@@ -41,32 +41,98 @@ extern "C"
 /** ULog version */
 #define BLACKBOX_LOG_VERSION 1
 
-/** Default ring buffer size (32 KB) */
+/** Default ring buffer size - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_DEFAULT_BUFFER_SIZE
+#define BLACKBOX_LOG_DEFAULT_BUFFER_SIZE (CONFIG_BLACKBOX_DEFAULT_BUFFER_SIZE * 1024)
+#else
 #define BLACKBOX_LOG_DEFAULT_BUFFER_SIZE (32 * 1024)
+#endif
 
-/** Minimum ring buffer size (16 KB) */
+/** Minimum ring buffer size - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_MIN_BUFFER_SIZE
+#define BLACKBOX_LOG_MIN_BUFFER_SIZE (CONFIG_BLACKBOX_MIN_BUFFER_SIZE * 1024)
+#else
 #define BLACKBOX_LOG_MIN_BUFFER_SIZE (16 * 1024)
+#endif
 
-/** Maximum message payload size */
+/** Maximum message payload size - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_MAX_MESSAGE_SIZE
+#define BLACKBOX_LOG_MAX_MESSAGE_SIZE CONFIG_BLACKBOX_MAX_MESSAGE_SIZE
+#else
 #define BLACKBOX_LOG_MAX_MESSAGE_SIZE 256
+#endif
 
-/** Default file size limit for rotation (512 KB) */
+/** Default file size limit for rotation - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_DEFAULT_FILE_SIZE_LIMIT
+#define BLACKBOX_LOG_DEFAULT_FILE_SIZE_LIMIT (CONFIG_BLACKBOX_DEFAULT_FILE_SIZE_LIMIT * 1024)
+#else
 #define BLACKBOX_LOG_DEFAULT_FILE_SIZE_LIMIT (512 * 1024)
+#endif
 
-/** Default flush interval in ms */
+/** Default flush interval in ms - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_DEFAULT_FLUSH_INTERVAL
+#define BLACKBOX_LOG_DEFAULT_FLUSH_INTERVAL_MS CONFIG_BLACKBOX_DEFAULT_FLUSH_INTERVAL
+#else
 #define BLACKBOX_LOG_DEFAULT_FLUSH_INTERVAL_MS 200
+#endif
 
-/** Writer task stack size */
+/** Writer task stack size - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_WRITER_TASK_STACK_SIZE
+#define BLACKBOX_LOG_WRITER_TASK_STACK_SIZE CONFIG_BLACKBOX_WRITER_TASK_STACK_SIZE
+#else
 #define BLACKBOX_LOG_WRITER_TASK_STACK_SIZE 4096
+#endif
 
-/** Writer task priority (low priority) */
+/** Writer task priority - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_WRITER_TASK_PRIORITY
+#define BLACKBOX_LOG_WRITER_TASK_PRIORITY CONFIG_BLACKBOX_WRITER_TASK_PRIORITY
+#else
 #define BLACKBOX_LOG_WRITER_TASK_PRIORITY 2
+#endif
 
-/** Maximum path length */
+/** Maximum path length - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_MAX_PATH_LENGTH
+#define BLACKBOX_LOG_MAX_PATH_LENGTH CONFIG_BLACKBOX_MAX_PATH_LENGTH
+#else
 #define BLACKBOX_LOG_MAX_PATH_LENGTH 128
+#endif
 
-/** Maximum tag length */
+/** Maximum tag length - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_MAX_TAG_LENGTH
+#define BLACKBOX_LOG_MAX_TAG_LENGTH CONFIG_BLACKBOX_MAX_TAG_LENGTH
+#else
 #define BLACKBOX_LOG_MAX_TAG_LENGTH 32
+#endif
+
+/** Panic memory dump size - configurable via Kconfig */
+#ifdef CONFIG_BLACKBOX_PANIC_MEMORY_DUMP_SIZE
+#define BLACKBOX_LOG_PANIC_MEMORY_DUMP_SIZE CONFIG_BLACKBOX_PANIC_MEMORY_DUMP_SIZE
+#else
+#define BLACKBOX_LOG_PANIC_MEMORY_DUMP_SIZE 256
+#endif
+
+/** Panic handler flags (32-bit bitmask) */
+#define BLACKBOX_PANIC_FLAG_NONE          0         /**< No panic features enabled */
+#define BLACKBOX_PANIC_FLAG_ENABLED       (1 << 0)  /**< Enable panic handler */
+#define BLACKBOX_PANIC_FLAG_BACKTRACE     (1 << 1)  /**< Include stack backtrace */
+#define BLACKBOX_PANIC_FLAG_REGISTERS     (1 << 2)  /**< Include CPU register dump */
+#define BLACKBOX_PANIC_FLAG_MEMORY_DUMP   (1 << 3)  /**< Include memory dump around SP */
+#define BLACKBOX_PANIC_FLAG_TASK_INFO     (1 << 4)  /**< Include current task info */
+#define BLACKBOX_PANIC_FLAG_HEAP_INFO     (1 << 5)  /**< Include heap statistics */
+/* Bits 6-31 reserved for future use */
+
+/** Default panic flags: enabled with backtrace and registers */
+#define BLACKBOX_PANIC_FLAGS_DEFAULT (BLACKBOX_PANIC_FLAG_ENABLED | \
+                                      BLACKBOX_PANIC_FLAG_BACKTRACE | \
+                                      BLACKBOX_PANIC_FLAG_REGISTERS)
+
+/** All panic flags enabled */
+#define BLACKBOX_PANIC_FLAGS_ALL (BLACKBOX_PANIC_FLAG_ENABLED | \
+                                  BLACKBOX_PANIC_FLAG_BACKTRACE | \
+                                  BLACKBOX_PANIC_FLAG_REGISTERS | \
+                                  BLACKBOX_PANIC_FLAG_MEMORY_DUMP | \
+                                  BLACKBOX_PANIC_FLAG_TASK_INFO | \
+                                  BLACKBOX_PANIC_FLAG_HEAP_INFO)
 
     /*******************************************************************************
      * ULog Message Types
@@ -77,13 +143,16 @@ extern "C"
      */
     typedef enum
     {
-        BLACKBOX_LOG_MSG_TYPE_LOG = 0x01,     /**< Standard log message */
-        BLACKBOX_LOG_MSG_TYPE_INFO = 0x02,    /**< Information message */
-        BLACKBOX_LOG_MSG_TYPE_MULTI = 0x03,   /**< Multi-part message */
-        BLACKBOX_LOG_MSG_TYPE_PARAM = 0x04,   /**< Parameter message */
-        BLACKBOX_LOG_MSG_TYPE_DATA = 0x05,    /**< Data message */
-        BLACKBOX_LOG_MSG_TYPE_DROPOUT = 0x06, /**< Dropout marker */
-        BLACKBOX_LOG_MSG_TYPE_SYNC = 0x07,    /**< Sync message */
+        BLACKBOX_LOG_MSG_TYPE_LOG = 0x01,       /**< Standard log message */
+        BLACKBOX_LOG_MSG_TYPE_INFO = 0x02,      /**< Information message */
+        BLACKBOX_LOG_MSG_TYPE_MULTI = 0x03,     /**< Multi-part message */
+        BLACKBOX_LOG_MSG_TYPE_PARAM = 0x04,     /**< Parameter message */
+        BLACKBOX_LOG_MSG_TYPE_DATA = 0x05,      /**< Data message */
+        BLACKBOX_LOG_MSG_TYPE_DROPOUT = 0x06,   /**< Dropout marker */
+        BLACKBOX_LOG_MSG_TYPE_SYNC = 0x07,      /**< Sync message */
+        BLACKBOX_LOG_MSG_TYPE_PANIC = 0x10,     /**< Panic/crash information */
+        BLACKBOX_LOG_MSG_TYPE_BACKTRACE = 0x11, /**< Backtrace data */
+        BLACKBOX_LOG_MSG_TYPE_COREDUMP = 0x12,  /**< Core dump marker */
     } blackbox_msg_type_t;
 
     /*******************************************************************************
@@ -125,6 +194,21 @@ extern "C"
         blackbox_level_t min_level; /**< Minimum log level to record */
         bool console_output;        /**< Enable console output via ESP_LOG */
         bool file_output;           /**< Enable file output */
+
+        /**
+         * @brief Panic handler flags (32-bit bitmask)
+         *
+         * Use BLACKBOX_PANIC_FLAG_* macros to configure:
+         * - BLACKBOX_PANIC_FLAG_ENABLED: Enable panic handler
+         * - BLACKBOX_PANIC_FLAG_BACKTRACE: Include stack backtrace
+         * - BLACKBOX_PANIC_FLAG_REGISTERS: Include CPU register dump
+         * - BLACKBOX_PANIC_FLAG_MEMORY_DUMP: Include memory dump around SP
+         * - BLACKBOX_PANIC_FLAG_TASK_INFO: Include current task info
+         * - BLACKBOX_PANIC_FLAG_HEAP_INFO: Include heap statistics
+         *
+         * Default: BLACKBOX_PANIC_FLAGS_DEFAULT
+         */
+        uint32_t panic_flags;
     } blackbox_config_t;
 
     /*******************************************************************************
@@ -313,6 +397,63 @@ extern "C"
      * @param config Pointer to config structure to fill with defaults
      */
     void blackbox_get_default_config(blackbox_config_t *config);
+
+    /**
+     * @brief Set panic handler flags at runtime
+     *
+     * Use BLACKBOX_PANIC_FLAG_* macros to configure panic behavior.
+     * Changes take effect immediately.
+     *
+     * @param flags Bitmask of BLACKBOX_PANIC_FLAG_* values
+     * @return esp_err_t ESP_OK on success
+     *
+     * @example
+     * // Enable panic with backtrace only
+     * blackbox_set_panic_flags(BLACKBOX_PANIC_FLAG_ENABLED | BLACKBOX_PANIC_FLAG_BACKTRACE);
+     *
+     * // Enable all panic features
+     * blackbox_set_panic_flags(BLACKBOX_PANIC_FLAGS_ALL);
+     *
+     * // Disable panic handler
+     * blackbox_set_panic_flags(BLACKBOX_PANIC_FLAG_NONE);
+     */
+    esp_err_t blackbox_set_panic_flags(uint32_t flags);
+
+    /**
+     * @brief Get current panic handler flags
+     *
+     * @return uint32_t Current panic flags bitmask
+     */
+    uint32_t blackbox_get_panic_flags(void);
+
+    /**
+     * @brief Enable or disable panic handler at runtime
+     *
+     * This is a convenience wrapper that sets/clears the BLACKBOX_PANIC_FLAG_ENABLED
+     * bit while preserving other flags.
+     *
+     * @param enable true to enable panic logging, false to disable
+     * @return esp_err_t ESP_OK on success
+     */
+    esp_err_t blackbox_set_panic_handler(bool enable);
+
+    /**
+     * @brief Check if panic handler is enabled
+     *
+     * @return bool true if panic handler is enabled and active
+     */
+    bool blackbox_is_panic_handler_enabled(void);
+
+    /**
+     * @brief Manually trigger a panic log entry (for testing)
+     *
+     * This function writes a test panic entry to the log file without
+     * actually causing a panic. Useful for testing the decoder.
+     *
+     * @param reason Simulated panic reason string
+     * @return esp_err_t ESP_OK on success
+     */
+    esp_err_t blackbox_log_test_panic(const char *reason);
 
 /*******************************************************************************
  * Logging Macros (Primary API)

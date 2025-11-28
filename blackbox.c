@@ -35,6 +35,18 @@
 
 #include <stdatomic.h>
 
+/* Panic handler support - always included, enabled at runtime */
+#include "esp_debug_helpers.h"
+#include "esp_cpu.h"
+#include "sdkconfig.h"
+
+/* Architecture-specific includes for register access */
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2 || CONFIG_IDF_TARGET_ESP32S3
+#include "xtensa_context.h"
+#elif CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32H2
+#include "riscv/rv_utils.h"
+#endif
+
 static const char *TAG = "BLACKBOX_LOG";
 
 /*******************************************************************************
@@ -86,6 +98,9 @@ typedef struct
     atomic_int min_level;
     atomic_bool console_output;
     atomic_bool file_output;
+
+    /* Panic handler flags (runtime configurable, 32-bit bitmask) */
+    atomic_uint panic_flags;
 } blackbox_state_t;
 
 static blackbox_state_t s_blackbox = {0};
@@ -104,6 +119,10 @@ static void console_output(blackbox_level_t level, const char *tag, const char *
 static size_t build_blackbox_packet(blackbox_packet_t *packet, blackbox_level_t level,
                                     const char *tag, const char *file, uint32_t line,
                                     const char *fmt, va_list args);
+
+/* Panic handler functions (always available, enabled at runtime) */
+static void write_panic_packet_direct(blackbox_msg_type_t msg_type, const char *data, size_t len);
+static void blackbox_shutdown_handler(void);
 
 /*******************************************************************************
  * Inline Performance Helpers
@@ -187,6 +206,9 @@ void blackbox_get_default_config(blackbox_config_t *config)
     config->min_level = BLACKBOX_LOG_LEVEL_INFO;
     config->console_output = true;
     config->file_output = true;
+
+    /* Panic handler defaults - enabled with backtrace and registers */
+    config->panic_flags = BLACKBOX_PANIC_FLAGS_DEFAULT;
 }
 
 /*******************************************************************************
@@ -335,6 +357,16 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
     }
 
     s_blackbox.initialized = true;
+
+    /* Initialize panic handler flags from config */
+    atomic_store(&s_blackbox.panic_flags, config->panic_flags);
+
+    /* Register shutdown handler if panic handler is enabled */
+    if (config->panic_flags & BLACKBOX_PANIC_FLAG_ENABLED)
+    {
+        esp_register_shutdown_handler((shutdown_handler_t)blackbox_shutdown_handler);
+        ESP_LOGI(TAG, "Panic handler registered (flags=0x%08x)", (unsigned int)config->panic_flags);
+    }
 
     ESP_LOGI(TAG, "Logger initialized: path=%s, encrypt=%d, buffer=%uKB",
              s_blackbox.config.root_path, s_blackbox.config.encrypt,
@@ -961,6 +993,309 @@ esp_err_t blackbox_reset_stats(void)
         atomic_store(&s_blackbox.messages_logged, 0);
         atomic_store(&s_blackbox.messages_dropped, 0);
         xSemaphoreGive(s_blackbox.stats_mutex);
+    }
+
+    return ESP_OK;
+}
+
+/*******************************************************************************
+ * Panic Handler Functions
+ ******************************************************************************/
+
+/**
+ * @brief Write a panic packet directly to file (synchronous, no ring buffer)
+ *
+ * This function is designed to be called from panic context where we cannot
+ * use FreeRTOS primitives or the ring buffer. It writes directly to the
+ * file handle if one is open.
+ */
+static void write_panic_packet_direct(blackbox_msg_type_t msg_type, const char *data, size_t len)
+{
+    if (s_blackbox.current_file == NULL)
+    {
+        return;
+    }
+
+    /* Build a minimal packet for panic data */
+    blackbox_packet_t packet = {0};
+
+    packet.header.magic[0] = BLACKBOX_LOG_MAGIC_BYTE0;
+    packet.header.magic[1] = BLACKBOX_LOG_MAGIC_BYTE1;
+    packet.header.magic[2] = BLACKBOX_LOG_MAGIC_BYTE2;
+    packet.header.magic[3] = BLACKBOX_LOG_MAGIC_BYTE3;
+    packet.header.version = BLACKBOX_LOG_VERSION;
+    packet.header.msg_type = (uint8_t)msg_type;
+    packet.header.level = (uint8_t)BLACKBOX_LOG_LEVEL_ERROR;
+    packet.header.reserved = 0;
+    packet.header.timestamp_us = esp_timer_get_time();
+    packet.header.tag_hash = blackbox_hash_string("PANIC");
+    packet.header.file_hash = 0;
+    packet.header.line = 0;
+
+    /* Truncate if necessary */
+    size_t payload_len = len;
+    if (payload_len >= BLACKBOX_LOG_MAX_MESSAGE_SIZE)
+    {
+        payload_len = BLACKBOX_LOG_MAX_MESSAGE_SIZE - 1;
+    }
+    packet.header.payload_length = (uint16_t)payload_len;
+
+    /* Copy payload */
+    memcpy(packet.payload, data, payload_len);
+
+    /* Calculate total size */
+    size_t packet_size = sizeof(blackbox_header_t) + payload_len;
+
+    /* Write directly to file - no encryption during panic (too complex) */
+    fwrite(&packet, 1, packet_size, s_blackbox.current_file);
+    fflush(s_blackbox.current_file);
+}
+
+/**
+ * @brief Custom shutdown handler that logs crash information to file
+ *
+ * This handler is called during system shutdown/panic. It captures as much
+ * information as possible and writes it to the log file.
+ *
+ * Note: This runs in a limited context - be careful with memory operations.
+ */
+static void blackbox_shutdown_handler(void)
+{
+    if (!s_blackbox.initialized)
+    {
+        return;
+    }
+
+    uint32_t flags = atomic_load(&s_blackbox.panic_flags);
+    if (!(flags & BLACKBOX_PANIC_FLAG_ENABLED))
+    {
+        return;
+    }
+
+    if (s_blackbox.current_file == NULL)
+    {
+        return;
+    }
+
+    char panic_buf[BLACKBOX_LOG_MAX_MESSAGE_SIZE];
+    int len;
+
+    /* Log shutdown/panic marker */
+    len = snprintf(panic_buf, sizeof(panic_buf), "PANIC/SHUTDOWN: System reset detected");
+    write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_PANIC, panic_buf, len);
+
+    /* Log backtrace if enabled */
+    if (flags & BLACKBOX_PANIC_FLAG_BACKTRACE)
+    {
+        len = snprintf(panic_buf, sizeof(panic_buf), "--- BACKTRACE ---");
+        write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_BACKTRACE, panic_buf, len);
+
+        /* Get backtrace using ESP-IDF debug helpers */
+        esp_backtrace_frame_t bt_frame;
+        esp_backtrace_get_start(&bt_frame.pc, &bt_frame.sp, &bt_frame.next_pc);
+
+        int depth = 0;
+        const int max_depth = 32;
+
+        while (depth < max_depth)
+        {
+            len = snprintf(panic_buf, sizeof(panic_buf),
+                           "BT#%02d: PC=0x%08x SP=0x%08x",
+                           depth,
+                           (unsigned int)bt_frame.pc,
+                           (unsigned int)bt_frame.sp);
+            write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_BACKTRACE, panic_buf, len);
+
+            if (!esp_backtrace_get_next_frame(&bt_frame))
+            {
+                break;
+            }
+            depth++;
+        }
+    }
+
+    /* Log registers if enabled - note: we don't have frame info in shutdown handler */
+    if (flags & BLACKBOX_PANIC_FLAG_REGISTERS)
+    {
+        len = snprintf(panic_buf, sizeof(panic_buf), "--- REGISTERS (at shutdown) ---");
+        write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_PANIC, panic_buf, len);
+
+        /* We can still get some info from backtrace */
+        esp_backtrace_frame_t bt_frame;
+        esp_backtrace_get_start(&bt_frame.pc, &bt_frame.sp, &bt_frame.next_pc);
+
+        len = snprintf(panic_buf, sizeof(panic_buf),
+                       "PC=0x%08x SP=0x%08x NextPC=0x%08x",
+                       (unsigned int)bt_frame.pc,
+                       (unsigned int)bt_frame.sp,
+                       (unsigned int)bt_frame.next_pc);
+        write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_PANIC, panic_buf, len);
+    }
+
+    /* Memory dump if enabled */
+    if (flags & BLACKBOX_PANIC_FLAG_MEMORY_DUMP)
+    {
+        esp_backtrace_frame_t bt_frame;
+        esp_backtrace_get_start(&bt_frame.pc, &bt_frame.sp, &bt_frame.next_pc);
+
+        uint32_t sp = bt_frame.sp;
+        if (sp != 0)
+        {
+            len = snprintf(panic_buf, sizeof(panic_buf), "--- STACK DUMP @ 0x%08x ---", (unsigned int)sp);
+            write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_PANIC, panic_buf, len);
+
+            /* Dump memory around SP */
+            const int dump_size = BLACKBOX_LOG_PANIC_MEMORY_DUMP_SIZE;
+            const int words_per_line = 4;
+            uint32_t *ptr = (uint32_t *)(sp & ~3); /* Align to 4 bytes */
+
+            for (int i = 0; i < dump_size / (words_per_line * 4); i++)
+            {
+                uint32_t addr = (uint32_t)(uintptr_t)ptr;
+                /* Simple bounds check - may not be perfect in panic context */
+                if (addr >= 0x3FF00000 && addr < 0x40000000)
+                {
+                    len = snprintf(panic_buf, sizeof(panic_buf),
+                                   "%08x: %08x %08x %08x %08x",
+                                   (unsigned int)addr,
+                                   (unsigned int)ptr[0],
+                                   (unsigned int)ptr[1],
+                                   (unsigned int)ptr[2],
+                                   (unsigned int)ptr[3]);
+                    write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_PANIC, panic_buf, len);
+                }
+                ptr += words_per_line;
+            }
+        }
+    }
+
+    /* Mark end of panic data */
+    len = snprintf(panic_buf, sizeof(panic_buf), "--- END PANIC DUMP ---");
+    write_panic_packet_direct(BLACKBOX_LOG_MSG_TYPE_COREDUMP, panic_buf, len);
+
+    /* Ensure all data is flushed to storage */
+    if (s_blackbox.current_file != NULL)
+    {
+        fflush(s_blackbox.current_file);
+        /* Note: fsync/fdatasync might not work in panic context on all platforms */
+    }
+
+    /* Also flush any remaining ring buffer data */
+    blackbox_flush();
+}
+
+/*******************************************************************************
+ * Panic Handler API Functions
+ ******************************************************************************/
+
+esp_err_t blackbox_set_panic_flags(uint32_t flags)
+{
+    if (!s_blackbox.initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    atomic_store(&s_blackbox.panic_flags, flags);
+    ESP_LOGI(TAG, "Panic flags set to 0x%08x", (unsigned int)flags);
+    return ESP_OK;
+}
+
+uint32_t blackbox_get_panic_flags(void)
+{
+    if (!s_blackbox.initialized)
+    {
+        return 0;
+    }
+    return atomic_load(&s_blackbox.panic_flags);
+}
+
+esp_err_t blackbox_set_panic_handler(bool enable)
+{
+    if (!s_blackbox.initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    uint32_t flags = atomic_load(&s_blackbox.panic_flags);
+    if (enable)
+    {
+        flags |= BLACKBOX_PANIC_FLAG_ENABLED;
+    }
+    else
+    {
+        flags &= ~BLACKBOX_PANIC_FLAG_ENABLED;
+    }
+    atomic_store(&s_blackbox.panic_flags, flags);
+    
+    ESP_LOGI(TAG, "Panic handler %s", enable ? "enabled" : "disabled");
+    return ESP_OK;
+}
+
+bool blackbox_is_panic_handler_enabled(void)
+{
+    return s_blackbox.initialized && 
+           (atomic_load(&s_blackbox.panic_flags) & BLACKBOX_PANIC_FLAG_ENABLED);
+}
+
+esp_err_t blackbox_log_test_panic(const char *reason)
+{
+    if (!s_blackbox.initialized)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (reason == NULL)
+    {
+        reason = "Test panic entry";
+    }
+
+    /* Create a test panic packet using the normal logging path */
+    char panic_buf[BLACKBOX_LOG_MAX_MESSAGE_SIZE];
+    int len = snprintf(panic_buf, sizeof(panic_buf),
+                       "TEST PANIC: %s | Core: %d | Time: %llu us",
+                       reason,
+                       xPortGetCoreID(),
+                       (unsigned long long)esp_timer_get_time());
+
+    /* Build and send test panic packet through normal path */
+    blackbox_packet_t packet = {0};
+
+    packet.header.magic[0] = BLACKBOX_LOG_MAGIC_BYTE0;
+    packet.header.magic[1] = BLACKBOX_LOG_MAGIC_BYTE1;
+    packet.header.magic[2] = BLACKBOX_LOG_MAGIC_BYTE2;
+    packet.header.magic[3] = BLACKBOX_LOG_MAGIC_BYTE3;
+    packet.header.version = BLACKBOX_LOG_VERSION;
+    packet.header.msg_type = (uint8_t)BLACKBOX_LOG_MSG_TYPE_PANIC;
+    packet.header.level = (uint8_t)BLACKBOX_LOG_LEVEL_ERROR;
+    packet.header.reserved = 0;
+    packet.header.timestamp_us = esp_timer_get_time();
+    packet.header.tag_hash = blackbox_hash_string("PANIC_TEST");
+    packet.header.file_hash = blackbox_hash_string(__FILE__);
+    packet.header.line = (uint16_t)__LINE__;
+    packet.header.payload_length = (uint16_t)len;
+    memcpy(packet.payload, panic_buf, len);
+
+    size_t packet_size = sizeof(blackbox_header_t) + len;
+
+    /* Console output */
+    if (atomic_load(&s_blackbox.console_output))
+    {
+        ESP_LOGE("PANIC_TEST", "%s", panic_buf);
+    }
+
+    /* File output via ring buffer */
+    if (atomic_load(&s_blackbox.file_output) && s_blackbox.ring_buffer != NULL)
+    {
+        BaseType_t result = xRingbufferSend(s_blackbox.ring_buffer, &packet, packet_size, 0);
+        if (result == pdTRUE)
+        {
+            atomic_fetch_add(&s_blackbox.messages_logged, 1);
+            xSemaphoreGive(s_blackbox.flush_sem);
+        }
+        else
+        {
+            atomic_fetch_add(&s_blackbox.messages_dropped, 1);
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     return ESP_OK;

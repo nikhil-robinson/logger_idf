@@ -1,0 +1,104 @@
+menu "Blackbox Logger Configuration"
+
+    menu "Buffer and Memory Settings"
+        config BLACKBOX_DEFAULT_BUFFER_SIZE
+            int "Default ring buffer size (KB)"
+            default 32
+            range 16 128
+            help
+                Default size of the ring buffer in kilobytes.
+                Larger buffers reduce the chance of message drops during
+                high-frequency logging but consume more RAM.
+                Minimum: 16 KB, Maximum: 128 KB
+
+        config BLACKBOX_MIN_BUFFER_SIZE
+            int "Minimum ring buffer size (KB)"
+            default 16
+            range 8 32
+            help
+                Minimum allowed ring buffer size in kilobytes.
+                Users cannot configure a buffer smaller than this value.
+
+        config BLACKBOX_MAX_MESSAGE_SIZE
+            int "Maximum message payload size (bytes)"
+            default 256
+            range 64 1024
+            help
+                Maximum size of a single log message payload in bytes.
+                Larger values allow longer messages but increase memory usage
+                per log entry.
+    endmenu
+
+    menu "File Settings"
+        config BLACKBOX_DEFAULT_FILE_SIZE_LIMIT
+            int "Default file size limit for rotation (KB)"
+            default 512
+            range 64 4096
+            help
+                Default maximum size of a single log file in kilobytes.
+                When a log file reaches this size, a new file is created.
+                Larger files reduce overhead but may be harder to manage.
+
+        config BLACKBOX_MAX_PATH_LENGTH
+            int "Maximum path length (bytes)"
+            default 128
+            range 64 256
+            help
+                Maximum length of file paths used by the logger.
+                Increase if you use deeply nested directories.
+
+        config BLACKBOX_DEFAULT_FLUSH_INTERVAL
+            int "Default flush interval (ms)"
+            default 200
+            range 50 5000
+            help
+                Default interval in milliseconds between automatic buffer
+                flushes to the filesystem. Lower values reduce data loss
+                risk but increase I/O overhead.
+    endmenu
+
+    menu "Task Settings"
+        config BLACKBOX_WRITER_TASK_STACK_SIZE
+            int "Writer task stack size (bytes)"
+            default 4096
+            range 2048 8192
+            help
+                Stack size for the background writer task that handles
+                file I/O operations. Increase if you experience stack
+                overflow issues.
+
+        config BLACKBOX_WRITER_TASK_PRIORITY
+            int "Writer task priority"
+            default 2
+            range 1 10
+            help
+                FreeRTOS priority for the background writer task.
+                Lower values mean lower priority. Keep this low to avoid
+                interfering with time-critical tasks.
+    endmenu
+
+    menu "Tag and Logging Settings"
+        config BLACKBOX_MAX_TAG_LENGTH
+            int "Maximum tag length (bytes)"
+            default 32
+            range 8 64
+            help
+                Maximum length of component tag strings.
+                Tags longer than this will be truncated.
+    endmenu
+
+    menu "Panic Handler Settings"
+        config BLACKBOX_PANIC_MEMORY_DUMP_SIZE
+            int "Panic memory dump size (bytes)"
+            default 256
+            range 64 1024
+            help
+                Size of the memory dump around the stack pointer captured
+                during a panic. Larger values provide more context but
+                take longer to write during crash.
+                This is only used if panic handler is enabled at runtime
+                via the config struct.
+    endmenu
+
+endmenu
+

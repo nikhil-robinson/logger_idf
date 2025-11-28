@@ -55,7 +55,7 @@ except ImportError:
 # Constants (must match blackbox.h)
 # ==============================================================================
 
-MAGIC_BYTES = bytes([0x55, 0x4C, 0x6F, 0x67])  # "ULog"
+MAGIC_BYTES = bytes([0x42, 0x4C, 0x42, 0x4F])  # "BLBO" (Blackbox)
 BLACKBOX_VERSION = 1
 MAX_MESSAGE_SIZE = 256
 
@@ -100,6 +100,9 @@ class MsgType(IntEnum):
     DATA = 0x05
     DROPOUT = 0x06
     SYNC = 0x07
+    PANIC = 0x10
+    BACKTRACE = 0x11
+    COREDUMP = 0x12
 
 
 # ==============================================================================
@@ -372,9 +375,18 @@ def format_text(packet: LogPacket) -> str:
         LogLevel.VERBOSE: '\033[90m',  # Gray
     }
     reset = '\033[0m'
+    bold = '\033[1m'
     
     color = level_colors.get(packet.level, '')
     level_str = f"[{packet.level.to_string():7s}]"
+    
+    # Special formatting for panic-related messages
+    if packet.msg_type == MsgType.PANIC:
+        return f"{packet.timestamp_str} {bold}\033[91m[PANIC  ]{reset} {bold}{packet.payload}{reset}"
+    elif packet.msg_type == MsgType.BACKTRACE:
+        return f"{packet.timestamp_str} {bold}\033[95m[BKTRACE]{reset} {packet.payload}"
+    elif packet.msg_type == MsgType.COREDUMP:
+        return f"{packet.timestamp_str} {bold}\033[96m[COREDMP]{reset} {packet.payload}"
     
     return f"{packet.timestamp_str} {color}{level_str}{reset} (tag:0x{packet.tag_hash:08X}, line:{packet.line}) {packet.payload}"
 
@@ -492,7 +504,9 @@ Examples:
 
     # Statistics
     stats = {level: 0 for level in LogLevel}
+    msg_type_stats = {msg_type: 0 for msg_type in MsgType}
     total_packets = 0
+    panic_count = 0
 
     # Open output file
     output_file = open(args.output, 'w', newline='') if args.output else sys.stdout
@@ -509,7 +523,12 @@ Examples:
         for packet in decoder.decode_file(args.logfile):
             # Update stats
             stats[packet.level] += 1
+            msg_type_stats[packet.msg_type] += 1
             total_packets += 1
+            
+            # Track panic events
+            if packet.msg_type in (MsgType.PANIC, MsgType.BACKTRACE, MsgType.COREDUMP):
+                panic_count += 1
 
             # Apply level filter
             if level_filter and packet.level > level_filter:
@@ -540,8 +559,16 @@ Examples:
         for level in LogLevel:
             if level != LogLevel.NONE and stats[level] > 0:
                 print(f"  {level.to_string():8s}: {stats[level]}", file=sys.stderr)
+        
+        # Print panic-related stats if any
+        if panic_count > 0:
+            print(f"\n  Panic/Crash Data:", file=sys.stderr)
+            for msg_type in (MsgType.PANIC, MsgType.BACKTRACE, MsgType.COREDUMP):
+                if msg_type_stats[msg_type] > 0:
+                    print(f"    {msg_type.name:10s}: {msg_type_stats[msg_type]}", file=sys.stderr)
+        
         if decoder.file_header:
-            print(f"  Device ID: {decoder.file_header.device_id}", file=sys.stderr)
+            print(f"\n  Device ID: {decoder.file_header.device_id}", file=sys.stderr)
             print(f"  Encrypted: {decoder.file_header.encrypted}", file=sys.stderr)
 
 

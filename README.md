@@ -52,6 +52,7 @@
 | 💾 **Filesystem Agnostic** | Works with SD card, SPIFFS, LittleFS, or any mounted filesystem |
 | ⚡ **Thread-Safe** | Safe to call from multiple tasks and cores simultaneously |
 | 📊 **Statistics** | Track messages logged, dropped, bytes written, and more |
+| 💥 **Panic Logging** | Capture crash information, backtraces, and register dumps to file |
 
 ---
 
@@ -137,6 +138,7 @@ Complete working examples are provided in the [`examples/`](examples/) directory
 | [**spiffs_example**](examples/spiffs_example/) | SPIFFS | ❌ | Internal flash logging for simple applications |
 | [**sdcard_example**](examples/sdcard_example/) | SD Card | ❌ | High-throughput logging for sensor controllers |
 | [**encryption_example**](examples/encryption_example/) | SD Card | ✅ | Secure logging with AES-256 encryption |
+| [**panic_example**](examples/panic_example/) | SD Card | ❌ | Crash/coredump logging with panic handler |
 
 ### Running an Example
 
@@ -164,7 +166,44 @@ typedef struct {
     blackbox_level_t min_level;     // Minimum log level
     bool console_output;            // Enable console output
     bool file_output;               // Enable file output
+    
+    // Panic handler configuration (32-bit flag bitmask)
+    uint32_t panic_flags;           // BLACKBOX_PANIC_FLAG_* bitmask
 } blackbox_config_t;
+```
+
+### Panic Handler Flags
+
+| Flag | Value | Description |
+|------|-------|-------------|
+| `BLACKBOX_PANIC_FLAG_NONE` | `0x00000000` | No panic features enabled |
+| `BLACKBOX_PANIC_FLAG_ENABLED` | `0x00000001` | Enable panic handler |
+| `BLACKBOX_PANIC_FLAG_BACKTRACE` | `0x00000002` | Include stack backtrace |
+| `BLACKBOX_PANIC_FLAG_REGISTERS` | `0x00000004` | Include CPU register dump |
+| `BLACKBOX_PANIC_FLAG_MEMORY_DUMP` | `0x00000008` | Include memory dump around SP |
+| `BLACKBOX_PANIC_FLAG_TASK_INFO` | `0x00000010` | Include current task info |
+| `BLACKBOX_PANIC_FLAG_HEAP_INFO` | `0x00000020` | Include heap statistics |
+| `BLACKBOX_PANIC_FLAGS_DEFAULT` | `0x00000007` | Enabled + backtrace + registers |
+| `BLACKBOX_PANIC_FLAGS_ALL` | `0x0000003F` | All features enabled |
+
+### Example Panic Configuration
+
+```c
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+
+// Default: panic enabled with backtrace and registers
+// config.panic_flags == BLACKBOX_PANIC_FLAGS_DEFAULT
+
+// Enable all panic features
+config.panic_flags = BLACKBOX_PANIC_FLAGS_ALL;
+
+// Custom: only backtrace, no memory dump
+config.panic_flags = BLACKBOX_PANIC_FLAG_ENABLED | 
+                     BLACKBOX_PANIC_FLAG_BACKTRACE;
+
+// Disable panic handler entirely
+config.panic_flags = BLACKBOX_PANIC_FLAG_NONE;
 ```
 
 ### Configuration Options
@@ -172,7 +211,7 @@ typedef struct {
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `root_path` | `const char*` | **Required** | Root path for log files (e.g., "/sdcard/logs") |
-| `file_prefix` | `const char*` | `"sensor"` | Log file name prefix |
+| `file_prefix` | `const char*` | `"flight"` | Log file name prefix |
 | `encrypt` | `bool` | `false` | Enable AES-256-CTR encryption |
 | `encryption_key` | `uint8_t[32]` | - | 256-bit AES key (required if `encrypt=true`) |
 | `file_size_limit` | `size_t` | `512 KB` | File rotation size limit |
@@ -181,6 +220,36 @@ typedef struct {
 | `min_level` | `blackbox_level_t` | `INFO` | Minimum log level to record |
 | `console_output` | `bool` | `true` | Mirror logs to ESP_LOG console |
 | `file_output` | `bool` | `true` | Write logs to binary file |
+| `panic_flags` | `uint32_t` | `0x07` | Panic handler flags (see table above) |
+
+### Kconfig Options (Compile-Time Constants)
+
+The following options can be configured via `idf.py menuconfig` under **Blackbox Logger Configuration**:
+
+#### Buffer and Memory Settings
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CONFIG_BLACKBOX_DEFAULT_BUFFER_SIZE` | `32` KB | Default ring buffer size |
+| `CONFIG_BLACKBOX_MIN_BUFFER_SIZE` | `16` KB | Minimum allowed buffer size |
+| `CONFIG_BLACKBOX_MAX_MESSAGE_SIZE` | `256` bytes | Maximum message payload size |
+
+#### File Settings
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CONFIG_BLACKBOX_DEFAULT_FILE_SIZE_LIMIT` | `512` KB | Default file rotation size |
+| `CONFIG_BLACKBOX_MAX_PATH_LENGTH` | `128` bytes | Maximum file path length |
+| `CONFIG_BLACKBOX_DEFAULT_FLUSH_INTERVAL` | `200` ms | Default flush interval |
+
+#### Task Settings
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CONFIG_BLACKBOX_WRITER_TASK_STACK_SIZE` | `4096` bytes | Writer task stack size |
+| `CONFIG_BLACKBOX_WRITER_TASK_PRIORITY` | `2` | Writer task FreeRTOS priority |
+
+#### Panic Handler Settings
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CONFIG_BLACKBOX_PANIC_MEMORY_DUMP_SIZE` | `256` bytes | Size of memory dump (64-1024) |
 
 ### Log Levels
 
@@ -249,6 +318,41 @@ esp_err_t blackbox_set_console_output(bool enable);
 esp_err_t blackbox_set_file_output(bool enable);
 ```
 
+### Panic Handler (Optional)
+
+```c
+// Set panic flags at runtime (use BLACKBOX_PANIC_FLAG_* macros)
+esp_err_t blackbox_set_panic_flags(uint32_t flags);
+
+// Get current panic flags
+uint32_t blackbox_get_panic_flags(void);
+
+// Enable/disable panic handler (convenience wrapper)
+esp_err_t blackbox_set_panic_handler(bool enable);
+
+// Check if panic handler is enabled
+bool blackbox_is_panic_handler_enabled(void);
+
+// Log a test panic entry (for testing decoder)
+esp_err_t blackbox_log_test_panic(const char* reason);
+```
+
+#### Runtime Panic Configuration Example
+
+```c
+// Enable all panic features at runtime
+blackbox_set_panic_flags(BLACKBOX_PANIC_FLAGS_ALL);
+
+// Disable only memory dump
+uint32_t flags = blackbox_get_panic_flags();
+flags &= ~BLACKBOX_PANIC_FLAG_MEMORY_DUMP;
+blackbox_set_panic_flags(flags);
+
+// Simple enable/disable
+blackbox_set_panic_handler(false);  // Disable
+blackbox_set_panic_handler(true);   // Re-enable (preserves other flags)
+```
+
 ### Statistics
 
 ```c
@@ -313,6 +417,32 @@ esp_err_t blackbox_reset_stats(void);
 | 24 | 2 | Line | Source line number |
 | 26 | 2 | Payload Len | Length of message payload |
 | 28 | N | Payload | UTF-8 message string |
+
+### Message Types
+
+| Type | Value | Description |
+|------|-------|-------------|
+| `LOG` | 0x01 | Standard log message |
+| `INFO` | 0x02 | Information message |
+| `MULTI` | 0x03 | Multi-part message |
+| `PARAM` | 0x04 | Parameter message |
+| `DATA` | 0x05 | Data message |
+| `DROPOUT` | 0x06 | Dropout marker |
+| `SYNC` | 0x07 | Sync message |
+| `PANIC` | 0x10 | Panic/crash information |
+| `BACKTRACE` | 0x11 | Backtrace data |
+| `COREDUMP` | 0x12 | Core dump marker |
+
+### Panic Log Data
+
+When panic logging is enabled, the following information is captured on crash:
+
+- **Panic Reason**: The cause of the crash (e.g., "LoadProhibited", "StoreProhibited", "InstrFetchProhibited")
+- **Core ID**: Which CPU core crashed
+- **Crash Address**: The memory address that caused the fault
+- **Backtrace**: Stack trace showing the call chain that led to the crash
+- **CPU Registers**: All general-purpose registers at crash time (PC, SP, A0-A15 for Xtensa; MEPC, RA, SP, etc. for RISC-V)
+- **Memory Dump** (optional): Memory contents around the stack pointer
 
 ---
 
@@ -496,7 +626,7 @@ Contributions are welcome! Please follow these steps:
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
 
 ---
 

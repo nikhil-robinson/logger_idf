@@ -1,6 +1,6 @@
 # Blackbox Logger Examples
 
-This folder contains three example applications demonstrating different use cases of the blackbox logger library.
+This folder contains example applications demonstrating different use cases of the blackbox logger library.
 
 ## Examples Overview
 
@@ -9,6 +9,7 @@ This folder contains three example applications demonstrating different use case
 | [spiffs_example](spiffs_example/) | SPIFFS | No | Internal flash logging, small logs |
 | [sdcard_example](sdcard_example/) | SD Card | No | High-throughput flight data logging |
 | [encryption_example](encryption_example/) | SD Card | AES-256 | Secure sensitive data logging |
+| [panic_example](panic_example/) | SD Card | No | Crash/coredump logging demonstration |
 
 ---
 
@@ -109,6 +110,42 @@ memcpy(config.encryption_key, your_256_bit_key, 32);
 - Use secure key storage (encrypted NVS, HSM)
 - Keep encryption keys separate from firmware
 - Consider secure provisioning during manufacturing
+
+---
+
+## 4. Panic Example
+
+**Location:** `examples/panic_example/`
+
+Demonstrates the automatic panic/coredump logging feature.
+
+### Features
+- Library automatically handles all crash logging internally
+- No callbacks or complex setup required
+- Just enable via `panic_flags` and call `blackbox_init()`
+
+### Best For
+- Debugging field crashes
+- Post-mortem analysis
+- Crash reporting systems
+
+### Configuration
+```c
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+config.panic_flags = BLACKBOX_PANIC_FLAGS_ALL;  // Enable panic logging
+blackbox_init(&config);  // That's it!
+```
+
+### What Gets Captured Automatically
+- Crash reason (LoadProhibited, assertion, etc.)
+- Stack backtrace
+- CPU register dump
+- Memory dump (optional)
+
+### Hardware Requirements
+- SD card module (same as sdcard_example)
+- ESP32 development board
 
 ---
 
