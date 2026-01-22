@@ -100,5 +100,45 @@ menu "Blackbox Logger Configuration"
                 via the config struct.
     endmenu
 
+    menu "Log Format Settings"
+        choice BLACKBOX_DEFAULT_LOG_FORMAT
+            prompt "Default log file format"
+            default BLACKBOX_FORMAT_NATIVE
+            help
+                Select the default log file format.
+                BBOX (Native) - Custom binary format with optional encryption
+                PX4 ULog - Compatible with PX4/QGroundControl analysis tools
+                ArduPilot DataFlash - Compatible with Mission Planner
+
+            config BLACKBOX_FORMAT_NATIVE
+                bool "BBOX (Native)"
+                help
+                    Native blackbox binary format with optional AES-256
+                    encryption support. Use for custom applications.
+
+            config BLACKBOX_FORMAT_PX4
+                bool "PX4 ULog (.ulg)"
+                help
+                    PX4 ULog format compatible with PX4 flight stack and
+                    analysis tools like FlightPlot, PlotJuggler, and
+                    QGroundControl log viewer.
+
+            config BLACKBOX_FORMAT_ARDUPILOT_DF
+                bool "ArduPilot DataFlash (.bin)"
+                help
+                    ArduPilot DataFlash binary format compatible with
+                    Mission Planner, MAVExplorer, and other ArduPilot
+                    log analysis tools.
+        endchoice
+
+        config BLACKBOX_STRUCT_LOGGING_ENABLED
+            bool "Enable structured message logging"
+            default y
+            help
+                Enable structured data logging for IMU, GPS, attitude,
+                PID, motor, and other flight controller data types.
+                Disable to reduce code size if only text logging is needed.
+    endmenu
+
 endmenu
 

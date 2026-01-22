@@ -1,19 +1,20 @@
 <p align="center">
   <img src="https://img.shields.io/badge/ESP--IDF-V5.2%2B-blue?&logo=espressif" alt="ESP-IDF">
   <img src="https://img.shields.io/badge/License-BSD3-green?" alt="License">
-  <img src="https://img.shields.io/badge/Version-1.0.0-orange?" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.0.0-orange?" alt="Version">
 </p>
 
 <h1 align="center">🛫 Blackbox Logger for ESP-IDF</h1>
 
 <p align="center">
-  <strong>A high-performance, non-blocking binary logging library for ESP32xx family</strong>
+  <strong>A high-performance flight data recorder for ESP32 drones and robotics</strong>
 </p>
 
 <p align="center">
   <a href="#-features">Features</a> •
   <a href="#-installation">Installation</a> •
   <a href="#-quick-start">Quick Start</a> •
+  <a href="#-structured-logging">Struct Logging</a> •
   <a href="#-examples">Examples</a> •
   <a href="#-api-reference">API</a> •
   <a href="#-tools">Tools</a>
@@ -26,6 +27,8 @@
 - [Features](#-features)
 - [Installation](#-installation)
 - [Quick Start](#-quick-start)
+- [Structured Flight Data Logging](#-structured-flight-data-logging)
+- [Log Formats](#-log-formats)
 - [Examples](#-examples)
 - [Configuration](#-configuration)
 - [API Reference](#-api-reference)
@@ -44,7 +47,8 @@
 | Feature | Description |
 |---------|-------------|
 | 🚀 **Non-blocking API** | Lock-free ring buffer ensures zero latency in tight control loops |
-| 📺 **Dual Output** | Simultaneous console (ESP_LOG) and binary file output |
+| 🛸 **Structured Flight Data** | Native support for IMU, GPS, PID, Motor, Battery, and more |
+| 📺 **Multi-Format Output** | PX4 ULog (.ulg), ArduPilot DataFlash (.bin), or native BBOX format |
 | 🔐 **AES-256 Encryption** | Optional encryption for secure, tamper-proof logs |
 | 🔄 **Auto File Rotation** | Automatic file rotation based on configurable size limits |
 | 🏷️ **Component Tags** | Organize logs by subsystem (IMU, MOTOR, GPS, etc.) |
@@ -129,12 +133,126 @@ void app_main(void)
 
 ---
 
+## � Structured Flight Data Logging
+
+Version 2.0 adds native support for structured flight controller data with industry-standard format compatibility.
+
+### Supported Message Types
+
+| Message Type | Struct | Rate | Description |
+|--------------|--------|------|-------------|
+| IMU | `bbox_msg_imu_t` | 100-1000 Hz | Gyroscope, accelerometer, temperature |
+| GPS | `bbox_msg_gps_t` | 1-10 Hz | Position, altitude, fix status, satellites |
+| Attitude | `bbox_msg_attitude_t` | 50-200 Hz | Roll, pitch, yaw (Euler angles) |
+| PID | `bbox_msg_pid_t` | 50-500 Hz | Controller state per axis |
+| Motor | `bbox_msg_motor_t` | 50-500 Hz | PWM outputs (up to 8 channels) |
+| Battery | `bbox_msg_battery_t` | 1-10 Hz | Voltage, current, capacity, temperature |
+| RC Input | `bbox_msg_rc_input_t` | 50 Hz | Radio control channel values |
+| Barometer | `bbox_msg_baro_t` | 10-50 Hz | Pressure, altitude, temperature |
+| Magnetometer | `bbox_msg_mag_t` | 10-100 Hz | 3-axis magnetic field |
+| ESC Telemetry | `bbox_msg_esc_t` | 10-50 Hz | Individual ESC data |
+| Status | `bbox_msg_status_t` | 1-10 Hz | Flight mode, arm state, errors |
+
+### Basic Usage
+
+```c
+#include "blackbox.h"
+#include "blackbox_messages.h"
+
+// Log IMU data at 100 Hz
+void imu_task(void *arg) {
+    bbox_msg_imu_t imu;
+    
+    while (1) {
+        // Read from your IMU hardware
+        imu.timestamp_us = esp_timer_get_time();
+        mpu6050_read(&imu.accel_x, &imu.accel_y, &imu.accel_z,
+                     &imu.gyro_x, &imu.gyro_y, &imu.gyro_z);
+        imu.temp = mpu6050_get_temp();
+        
+        // Log it (non-blocking)
+        blackbox_log_imu(&imu);
+        
+        vTaskDelay(pdMS_TO_TICKS(10));  // 100 Hz
+    }
+}
+
+// Log GPS data at 10 Hz
+void gps_task(void *arg) {
+    bbox_msg_gps_t gps;
+    
+    while (1) {
+        gps.timestamp_us = esp_timer_get_time();
+        gps.lat = gps_get_latitude() * 1e7;  // degrees * 1e7
+        gps.lon = gps_get_longitude() * 1e7;
+        gps.alt_mm = gps_get_altitude() * 1000;
+        gps.satellites = gps_get_sat_count();
+        gps.fix_type = gps_get_fix_type();
+        
+        blackbox_log_gps(&gps);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));  // 10 Hz
+    }
+}
+```
+
+---
+
+## 📄 Log Formats
+
+Choose the format that best fits your workflow:
+
+| Format | Extension | Encryption | Use Case |
+|--------|-----------|------------|----------|
+| **BBOX Native** | `.blackbox` | ✅ AES-256 | Custom applications, secure logging |
+| **PX4 ULog** | `.ulg` | ❌ | PX4/QGroundControl ecosystem |
+| **ArduPilot DataFlash** | `.bin` | ❌ | Mission Planner, MAVExplorer |
+
+### Format Selection
+
+```c
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+
+// Option 1: Native format with encryption
+config.log_format = BLACKBOX_FORMAT_BBOX;
+config.encrypt = true;
+memcpy(config.encryption_key, my_key, 32);
+
+// Option 2: PX4 ULog for FlightPlot/QGroundControl
+config.log_format = BLACKBOX_FORMAT_PX4_ULOG;
+
+// Option 3: ArduPilot for Mission Planner
+config.log_format = BLACKBOX_FORMAT_ARDUPILOT;
+
+blackbox_init(&config);
+```
+
+### Tool Compatibility
+
+**PX4 ULog (.ulg)**:
+- [QGroundControl](https://qgroundcontrol.com/) - Built-in log viewer
+- [FlightPlot](https://github.com/PX4/FlightPlot) - Java log plotter
+- [PlotJuggler](https://www.plotjuggler.io/) - Real-time visualization
+- [pyulog](https://github.com/PX4/pyulog) - Python parsing library
+
+**ArduPilot DataFlash (.bin)**:
+- [Mission Planner](https://ardupilot.org/planner/) - Log Review tab
+- [MAVExplorer](https://ardupilot.org/dev/docs/using-mavexplorer-for-log-analysis.html)
+- [UAV Log Viewer](https://plot.ardupilot.org/) - Web-based
+
+**BBOX Native (.blackbox)**:
+- `tools/blackbox_decoder.py` - Included Python decoder
+
+---
+
 ## 📚 Examples
 
 Complete working examples are provided in the [`examples/`](examples/) directory:
 
 | Example | Storage | Encryption | Description |
 |---------|---------|------------|-------------|
+| [**flight_data_example**](examples/flight_data_example/) | SPIFFS | ❌ | 🆕 Structured IMU/GPS/PID/Motor logging |
 | [**spiffs_example**](examples/spiffs_example/) | SPIFFS | ❌ | Internal flash logging for simple applications |
 | [**sdcard_example**](examples/sdcard_example/) | SD Card | ❌ | High-throughput logging for sensor controllers |
 | [**encryption_example**](examples/encryption_example/) | SD Card | ✅ | Secure logging with AES-256 encryption |
@@ -158,7 +276,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 typedef struct {
     const char* root_path;          // Log directory path
     const char* file_prefix;        // File name prefix
-    bool encrypt;                   // Enable AES-256 encryption
+    bool encrypt;                   // Enable AES-256 encryption (BBOX format only)
     uint8_t encryption_key[32];     // 256-bit encryption key
     size_t file_size_limit;         // File rotation size
     size_t buffer_size;             // Ring buffer size
@@ -166,6 +284,9 @@ typedef struct {
     blackbox_level_t min_level;     // Minimum log level
     bool console_output;            // Enable console output
     bool file_output;               // Enable file output
+    
+    // Log format selection (new in v2.0)
+    blackbox_log_format_t log_format; // BLACKBOX_FORMAT_BBOX, _PX4_ULOG, or _ARDUPILOT
     
     // Panic handler configuration (32-bit flag bitmask)
     uint32_t panic_flags;           // BLACKBOX_PANIC_FLAG_* bitmask

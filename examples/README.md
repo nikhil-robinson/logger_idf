@@ -6,6 +6,7 @@ This folder contains example applications demonstrating different use cases of t
 
 | Example | Storage | Encryption | Use Case |
 |---------|---------|------------|----------|
+| [flight_data_example](flight_data_example/) | SPIFFS | No | **NEW** Structured IMU/GPS/PID/Motor logging |
 | [spiffs_example](spiffs_example/) | SPIFFS | No | Internal flash logging, small logs |
 | [sdcard_example](sdcard_example/) | SD Card | No | High-throughput flight data logging |
 | [encryption_example](encryption_example/) | SD Card | AES-256 | Secure sensitive data logging |
@@ -113,7 +114,56 @@ memcpy(config.encryption_key, your_256_bit_key, 32);
 
 ---
 
-## 4. Panic Example
+## 4. Flight Data Example (NEW in v2.0)
+
+**Location:** `examples/flight_data_example/`
+
+Demonstrates structured flight data logging with IMU, GPS, PID, and motor telemetry.
+
+### Features
+- High-frequency IMU logging (100 Hz)
+- GPS, Attitude, Motor, Battery logging (10 Hz)  
+- PID controller state logging (50 Hz)
+- Multiple log format support (BBOX, PX4 ULog, ArduPilot DataFlash)
+
+### Best For
+- Drone/quadcopter flight data recording
+- Robotics sensor fusion debugging
+- Vehicle telemetry logging
+- Integration with PX4/ArduPilot analysis tools
+
+### Configuration
+```c
+#include "blackbox.h"
+#include "blackbox_messages.h"
+
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+config.log_format = BLACKBOX_FORMAT_PX4_ULOG;  // or _ARDUPILOT, _BBOX
+blackbox_init(&config);
+
+// Log IMU data
+bbox_msg_imu_t imu;
+imu.timestamp_us = esp_timer_get_time();
+imu.gyro_x = mpu_get_gyro_x();
+// ... fill other fields
+blackbox_log_imu(&imu);
+```
+
+### Log Format Compatibility
+
+| Format | Extension | Compatible Tools |
+|--------|-----------|------------------|
+| PX4 ULog | `.ulg` | QGroundControl, FlightPlot, PlotJuggler |
+| ArduPilot | `.bin` | Mission Planner, MAVExplorer |
+| BBOX Native | `.blackbox` | `blackbox_decoder.py --struct` |
+
+### Hardware Requirements
+- Any ESP32 board with SPIFFS or SD card
+
+---
+
+## 5. Panic Example
 
 **Location:** `examples/panic_example/`
 

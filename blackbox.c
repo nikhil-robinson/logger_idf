@@ -14,6 +14,7 @@
  */
 
 #include "blackbox.h"
+#include "blackbox_formats.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@
 #include "esp_mac.h"
 #include "esp_attr.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "mbedtls/aes.h"
 #include "mbedtls/cipher.h"
 
@@ -38,6 +40,7 @@
 /* Panic handler support - always included, enabled at runtime */
 #include "esp_debug_helpers.h"
 #include "esp_cpu.h"
+#include "esp_memory_utils.h"
 #include "sdkconfig.h"
 
 /* Architecture-specific includes for register access */
@@ -69,21 +72,30 @@ typedef struct
     bool initialized;
     blackbox_config_t config;
 
+    /* Deep-copied config strings (owned by logger) */
+    char *root_path_copy;
+    char *file_prefix_copy;
+
     /* Ring buffer */
     RingbufHandle_t ring_buffer;
 
     /* Writer task */
     TaskHandle_t writer_task;
     SemaphoreHandle_t flush_sem;
-    volatile bool shutdown_requested;
+    atomic_bool shutdown_requested;
+    SemaphoreHandle_t task_done_sem;  /**< Signaled when writer task exits */
 
     /* File management */
     FILE *current_file;
     char current_file_path[BLACKBOX_LOG_MAX_PATH_LENGTH];
-    size_t current_file_size;
-    uint32_t file_counter;
+    atomic_size_t current_file_size;  /**< Atomic for thread-safe rotation check */
+    atomic_uint_fast32_t file_counter;
+    SemaphoreHandle_t file_mutex;     /**< Protects file operations */
 
-    /* Encryption context */
+    /* Format encoder context */
+    bbox_format_ctx_t format_ctx;
+
+    /* Encryption context (BBOX format only) */
     mbedtls_cipher_context_t cipher_ctx;
     uint8_t iv[16];
     uint32_t iv_counter;
@@ -91,6 +103,7 @@ typedef struct
     /* Statistics (atomic for lock-free hot path) */
     atomic_uint_fast64_t messages_logged;
     atomic_uint_fast64_t messages_dropped;
+    atomic_uint_fast64_t struct_messages_logged;  /**< Struct messages logged */
     blackbox_stats_t stats;
     SemaphoreHandle_t stats_mutex;
 
@@ -124,6 +137,9 @@ static size_t build_blackbox_packet(blackbox_packet_t *packet, blackbox_level_t 
 static void write_panic_packet_direct(blackbox_msg_type_t msg_type, const char *data, size_t len);
 static void blackbox_shutdown_handler(void);
 
+/* CRC-16 calculation (CCITT polynomial) */
+static uint16_t calculate_crc16(const uint8_t *data, size_t len);
+
 /*******************************************************************************
  * Inline Performance Helpers
  ******************************************************************************/
@@ -148,6 +164,30 @@ static inline uint32_t get_tag_hash(const char *tag)
 /*******************************************************************************
  * Utility Functions
  ******************************************************************************/
+
+/**
+ * @brief Calculate CRC-16 checksum (CCITT polynomial 0x1021)
+ */
+static uint16_t calculate_crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++)
+    {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 0x8000)
+            {
+                crc = (crc << 1) ^ 0x1021;
+            }
+            else
+            {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
 
 IRAM_ATTR uint32_t blackbox_hash_string(const char *str)
 {
@@ -206,6 +246,7 @@ void blackbox_get_default_config(blackbox_config_t *config)
     config->min_level = BLACKBOX_LOG_LEVEL_INFO;
     config->console_output = true;
     config->file_output = true;
+    config->log_format = BLACKBOX_FORMAT_BBOX;  /* Default to native format */
 
     /* Panic handler defaults - enabled with backtrace and registers */
     config->panic_flags = BLACKBOX_PANIC_FLAGS_DEFAULT;
@@ -235,19 +276,52 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Validate encryption key if encryption is enabled */
+    if (config->encrypt)
+    {
+        bool key_is_zero = true;
+        for (int i = 0; i < 32; i++)
+        {
+            if (config->encryption_key[i] != 0)
+            {
+                key_is_zero = false;
+                break;
+            }
+        }
+        if (key_is_zero)
+        {
+            ESP_LOGE(TAG, "Encryption enabled but key is all zeros");
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
     /* Store configuration */
     memcpy(&s_blackbox.config, config, sizeof(blackbox_config_t));
+
+    /* Deep-copy string members to avoid use-after-free */
+    s_blackbox.root_path_copy = strdup(config->root_path);
+    if (s_blackbox.root_path_copy == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate root_path copy");
+        return ESP_ERR_NO_MEM;
+    }
+    s_blackbox.config.root_path = s_blackbox.root_path_copy;
+
+    const char *prefix = config->file_prefix ? config->file_prefix : "flight";
+    s_blackbox.file_prefix_copy = strdup(prefix);
+    if (s_blackbox.file_prefix_copy == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate file_prefix copy");
+        free(s_blackbox.root_path_copy);
+        s_blackbox.root_path_copy = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    s_blackbox.config.file_prefix = s_blackbox.file_prefix_copy;
 
     /* Enforce minimum buffer size */
     if (s_blackbox.config.buffer_size < BLACKBOX_LOG_MIN_BUFFER_SIZE)
     {
         s_blackbox.config.buffer_size = BLACKBOX_LOG_MIN_BUFFER_SIZE;
-    }
-
-    /* Set default file prefix if not provided */
-    if (s_blackbox.config.file_prefix == NULL)
-    {
-        s_blackbox.config.file_prefix = "flight";
     }
 
     /* Set default flush interval */
@@ -266,12 +340,17 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
     atomic_store(&s_blackbox.min_level, (int)config->min_level);
     atomic_store(&s_blackbox.console_output, config->console_output);
     atomic_store(&s_blackbox.file_output, config->file_output);
+    atomic_store(&s_blackbox.shutdown_requested, false);
+    atomic_store(&s_blackbox.file_counter, 0);
+    atomic_store(&s_blackbox.current_file_size, 0);
 
     /* Create ring buffer */
     s_blackbox.ring_buffer = xRingbufferCreate(s_blackbox.config.buffer_size, RINGBUF_TYPE_NOSPLIT);
     if (s_blackbox.ring_buffer == NULL)
     {
         ESP_LOGE(TAG, "Failed to create ring buffer");
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
         return ESP_ERR_NO_MEM;
     }
 
@@ -281,6 +360,33 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
     {
         ESP_LOGE(TAG, "Failed to create flush semaphore");
         vRingbufferDelete(s_blackbox.ring_buffer);
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Create task completion semaphore */
+    s_blackbox.task_done_sem = xSemaphoreCreateBinary();
+    if (s_blackbox.task_done_sem == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create task done semaphore");
+        vSemaphoreDelete(s_blackbox.flush_sem);
+        vRingbufferDelete(s_blackbox.ring_buffer);
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Create file mutex for thread-safe file operations */
+    s_blackbox.file_mutex = xSemaphoreCreateMutex();
+    if (s_blackbox.file_mutex == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create file mutex");
+        vSemaphoreDelete(s_blackbox.task_done_sem);
+        vSemaphoreDelete(s_blackbox.flush_sem);
+        vRingbufferDelete(s_blackbox.ring_buffer);
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
         return ESP_ERR_NO_MEM;
     }
 
@@ -289,8 +395,12 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
     if (s_blackbox.stats_mutex == NULL)
     {
         ESP_LOGE(TAG, "Failed to create stats mutex");
+        vSemaphoreDelete(s_blackbox.file_mutex);
+        vSemaphoreDelete(s_blackbox.task_done_sem);
         vSemaphoreDelete(s_blackbox.flush_sem);
         vRingbufferDelete(s_blackbox.ring_buffer);
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
         return ESP_ERR_NO_MEM;
     }
 
@@ -305,8 +415,12 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
         {
             ESP_LOGE(TAG, "Failed to setup cipher: %d", ret);
             vSemaphoreDelete(s_blackbox.stats_mutex);
+            vSemaphoreDelete(s_blackbox.file_mutex);
+            vSemaphoreDelete(s_blackbox.task_done_sem);
             vSemaphoreDelete(s_blackbox.flush_sem);
             vRingbufferDelete(s_blackbox.ring_buffer);
+            free(s_blackbox.root_path_copy);
+            free(s_blackbox.file_prefix_copy);
             return ESP_FAIL;
         }
 
@@ -317,13 +431,16 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
             ESP_LOGE(TAG, "Failed to set encryption key: %d", ret);
             mbedtls_cipher_free(&s_blackbox.cipher_ctx);
             vSemaphoreDelete(s_blackbox.stats_mutex);
+            vSemaphoreDelete(s_blackbox.file_mutex);
+            vSemaphoreDelete(s_blackbox.task_done_sem);
             vSemaphoreDelete(s_blackbox.flush_sem);
             vRingbufferDelete(s_blackbox.ring_buffer);
+            free(s_blackbox.root_path_copy);
+            free(s_blackbox.file_prefix_copy);
             return ESP_FAIL;
         }
 
-        /* Initialize IV with random data */
-        esp_fill_random(s_blackbox.iv, sizeof(s_blackbox.iv));
+        /* IV will be generated fresh for each file in create_new_log_file() */
         s_blackbox.iv_counter = 0;
     }
 
@@ -331,19 +448,20 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
     memset(&s_blackbox.stats, 0, sizeof(blackbox_stats_t));
     atomic_store(&s_blackbox.messages_logged, 0);
     atomic_store(&s_blackbox.messages_dropped, 0);
+    atomic_store(&s_blackbox.struct_messages_logged, 0);
+
+    /* Initialize format context for structured logging */
+    bbox_format_ctx_init(&s_blackbox.format_ctx, (bbox_log_format_t)s_blackbox.config.log_format);
 
     /* Initialize file management */
     s_blackbox.current_file = NULL;
-    s_blackbox.current_file_size = 0;
-    s_blackbox.file_counter = 0;
-    s_blackbox.shutdown_requested = false;
 
     /* Create writer task */
-    BaseType_t ret = xTaskCreate(writer_task, "blackbox_writer",
+    BaseType_t xret = xTaskCreate(writer_task, "blackbox_writer",
                                  BLACKBOX_LOG_WRITER_TASK_STACK_SIZE,
                                  NULL, BLACKBOX_LOG_WRITER_TASK_PRIORITY,
                                  &s_blackbox.writer_task);
-    if (ret != pdPASS)
+    if (xret != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create writer task");
         if (s_blackbox.config.encrypt)
@@ -351,8 +469,12 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
             mbedtls_cipher_free(&s_blackbox.cipher_ctx);
         }
         vSemaphoreDelete(s_blackbox.stats_mutex);
+        vSemaphoreDelete(s_blackbox.file_mutex);
+        vSemaphoreDelete(s_blackbox.task_done_sem);
         vSemaphoreDelete(s_blackbox.flush_sem);
         vRingbufferDelete(s_blackbox.ring_buffer);
+        free(s_blackbox.root_path_copy);
+        free(s_blackbox.file_prefix_copy);
         return ESP_ERR_NO_MEM;
     }
 
@@ -368,9 +490,11 @@ esp_err_t blackbox_init(const blackbox_config_t *config)
         ESP_LOGI(TAG, "Panic handler registered (flags=0x%08x)", (unsigned int)config->panic_flags);
     }
 
-    ESP_LOGI(TAG, "Logger initialized: path=%s, encrypt=%d, buffer=%uKB",
+    ESP_LOGI(TAG, "Logger initialized: path=%s, encrypt=%d, buffer=%uKB, format=%s",
              s_blackbox.config.root_path, s_blackbox.config.encrypt,
-             (unsigned)(s_blackbox.config.buffer_size / 1024));
+             (unsigned)(s_blackbox.config.buffer_size / 1024),
+             s_blackbox.config.log_format == BLACKBOX_FORMAT_PX4_ULOG ? "PX4_ULOG" :
+             s_blackbox.config.log_format == BLACKBOX_FORMAT_ARDUPILOT ? "ARDUPILOT" : "BBOX");
 
     return ESP_OK;
 }
@@ -384,25 +508,38 @@ esp_err_t blackbox_deinit(void)
 
     ESP_LOGI(TAG, "Shutting down logger...");
 
-    /* Request shutdown */
-    s_blackbox.shutdown_requested = true;
+    /* Unregister shutdown handler to avoid stale pointer on re-init */
+    if (atomic_load(&s_blackbox.panic_flags) & BLACKBOX_PANIC_FLAG_ENABLED)
+    {
+        esp_unregister_shutdown_handler((shutdown_handler_t)blackbox_shutdown_handler);
+    }
+
+    /* Request shutdown using atomic store */
+    atomic_store(&s_blackbox.shutdown_requested, true);
     xSemaphoreGive(s_blackbox.flush_sem);
 
-    /* Wait for writer task to finish (max 5 seconds) */
-    for (int i = 0; i < 50 && s_blackbox.writer_task != NULL; i++)
+    /* Wait for writer task to signal completion (max 5 seconds) */
+    if (xSemaphoreTake(s_blackbox.task_done_sem, pdMS_TO_TICKS(5000)) != pdTRUE)
     {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGW(TAG, "Writer task did not exit gracefully, force deleting");
+        if (s_blackbox.writer_task != NULL)
+        {
+            vTaskDelete(s_blackbox.writer_task);
+        }
     }
+    s_blackbox.writer_task = NULL;
 
-    /* Force delete task if still running */
-    if (s_blackbox.writer_task != NULL)
+    /* Close current file (protected by mutex) */
+    if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE)
     {
-        vTaskDelete(s_blackbox.writer_task);
-        s_blackbox.writer_task = NULL;
+        close_current_file();
+        xSemaphoreGive(s_blackbox.file_mutex);
     }
-
-    /* Close current file */
-    close_current_file();
+    else
+    {
+        /* Force close anyway */
+        close_current_file();
+    }
 
     /* Free encryption context */
     if (s_blackbox.config.encrypt)
@@ -412,8 +549,16 @@ esp_err_t blackbox_deinit(void)
 
     /* Delete semaphores and ring buffer */
     vSemaphoreDelete(s_blackbox.stats_mutex);
+    vSemaphoreDelete(s_blackbox.file_mutex);
+    vSemaphoreDelete(s_blackbox.task_done_sem);
     vSemaphoreDelete(s_blackbox.flush_sem);
     vRingbufferDelete(s_blackbox.ring_buffer);
+
+    /* Free deep-copied strings */
+    free(s_blackbox.root_path_copy);
+    free(s_blackbox.file_prefix_copy);
+    s_blackbox.root_path_copy = NULL;
+    s_blackbox.file_prefix_copy = NULL;
 
     s_blackbox.initialized = false;
 
@@ -468,8 +613,15 @@ static size_t build_blackbox_packet(blackbox_packet_t *packet, blackbox_level_t 
     }
     packet->header.payload_length = (uint16_t)payload_len;
 
+    /* Calculate total packet size */
+    size_t packet_size = sizeof(blackbox_header_t) + payload_len;
+
+    /* Calculate CRC-16 over header (excluding crc16 field) and payload */
+    size_t crc_data_len = sizeof(blackbox_header_t) - sizeof(uint16_t) + payload_len;
+    packet->header.crc16 = calculate_crc16((const uint8_t *)packet, crc_data_len);
+
     /* Return total packet size (header + actual payload size) */
-    return sizeof(blackbox_header_t) + payload_len;
+    return packet_size;
 }
 
 /**
@@ -614,13 +766,39 @@ static esp_err_t create_new_log_file(void)
     /* Close existing file if open */
     close_current_file();
 
-    /* Generate new file name */
-    s_blackbox.file_counter++;
+    /* Generate new file counter with overflow protection */
+    uint32_t counter = atomic_fetch_add(&s_blackbox.file_counter, 1);
+    
+    /* Wrap counter to prevent overflow (max 999999 files before wrapping) */
+    if (counter > 999999)
+    {
+        atomic_store(&s_blackbox.file_counter, 1);
+        counter = 0;
+        ESP_LOGW(TAG, "File counter wrapped around - old logs may be overwritten");
+    }
+
+    /* Determine file extension based on log format */
+    const char *extension;
+    switch (s_blackbox.config.log_format)
+    {
+        case BLACKBOX_FORMAT_PX4_ULOG:
+            extension = "ulg";
+            break;
+        case BLACKBOX_FORMAT_ARDUPILOT:
+            extension = "bin";
+            break;
+        case BLACKBOX_FORMAT_BBOX:
+        default:
+            extension = "blackbox";
+            break;
+    }
+
     snprintf(s_blackbox.current_file_path, BLACKBOX_LOG_MAX_PATH_LENGTH,
-             "%s/%s%03lu.blackbox",
+             "%s/%s%06lu.%s",
              s_blackbox.config.root_path,
              s_blackbox.config.file_prefix,
-             (unsigned long)s_blackbox.file_counter);
+             (unsigned long)(counter + 1),
+             extension);
 
     /* Open file for writing */
     s_blackbox.current_file = fopen(s_blackbox.current_file_path, "wb");
@@ -630,7 +808,14 @@ static esp_err_t create_new_log_file(void)
         return ESP_FAIL;
     }
 
-    s_blackbox.current_file_size = 0;
+    atomic_store(&s_blackbox.current_file_size, 0);
+
+    /* Generate fresh IV for this file (security: prevent IV reuse) */
+    if (s_blackbox.config.encrypt)
+    {
+        esp_fill_random(s_blackbox.iv, sizeof(s_blackbox.iv));
+        s_blackbox.iv_counter = 0;
+    }
 
     /* Write file header */
     esp_err_t ret = write_file_header();
@@ -641,7 +826,7 @@ static esp_err_t create_new_log_file(void)
         return ret;
     }
 
-    if (xSemaphoreTake(s_blackbox.stats_mutex, portMAX_DELAY) == pdTRUE)
+    if (xSemaphoreTake(s_blackbox.stats_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
         s_blackbox.stats.files_created++;
         xSemaphoreGive(s_blackbox.stats_mutex);
@@ -654,49 +839,124 @@ static esp_err_t create_new_log_file(void)
 
 static esp_err_t write_file_header(void)
 {
-    blackbox_file_header_t header = {0};
+    size_t written;
 
-    header.magic[0] = BLACKBOX_LOG_MAGIC_BYTE0;
-    header.magic[1] = BLACKBOX_LOG_MAGIC_BYTE1;
-    header.magic[2] = BLACKBOX_LOG_MAGIC_BYTE2;
-    header.magic[3] = BLACKBOX_LOG_MAGIC_BYTE3;
-    header.version = BLACKBOX_LOG_VERSION;
-    header.flags = s_blackbox.config.encrypt ? 0x01 : 0x00;
-    header.header_size = sizeof(blackbox_file_header_t);
-    header.timestamp_us = esp_timer_get_time();
-
-    /* Get device MAC as identifier */
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(header.device_id, sizeof(header.device_id),
-             "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    /* Write header directly (not encrypted) */
-    size_t written = fwrite(&header, 1, sizeof(header), s_blackbox.current_file);
-    if (written != sizeof(header))
+    /* Write format-specific header based on log format */
+    switch (s_blackbox.config.log_format)
     {
-        ESP_LOGE(TAG, "Failed to write file header");
-        return ESP_FAIL;
-    }
-
-    s_blackbox.current_file_size += written;
-
-    /* If encrypted, also write the IV after the header */
-    if (s_blackbox.config.encrypt)
-    {
-        written = fwrite(s_blackbox.iv, 1, sizeof(s_blackbox.iv), s_blackbox.current_file);
-        if (written != sizeof(s_blackbox.iv))
+        case BLACKBOX_FORMAT_PX4_ULOG:
         {
-            ESP_LOGE(TAG, "Failed to write IV");
-            return ESP_FAIL;
-        }
-        s_blackbox.current_file_size += written;
+            /* PX4 ULog file header (16 bytes magic + 8 bytes timestamp) */
+            ulog_file_header_t ulog_header = {0};
+            memcpy(ulog_header.magic, ULOG_MAGIC, 7);
+            ulog_header.version = 1;
+            ulog_header.timestamp_us = esp_timer_get_time();
 
-        /* Reset cipher for new file */
-        mbedtls_cipher_reset(&s_blackbox.cipher_ctx);
-        mbedtls_cipher_set_iv(&s_blackbox.cipher_ctx, s_blackbox.iv, sizeof(s_blackbox.iv));
+            written = fwrite(&ulog_header, 1, sizeof(ulog_header), s_blackbox.current_file);
+            if (written != sizeof(ulog_header))
+            {
+                ESP_LOGE(TAG, "Failed to write ULog file header");
+                return ESP_FAIL;
+            }
+            atomic_fetch_add(&s_blackbox.current_file_size, written);
+
+            /* Write INFO message with system name */
+            uint8_t info_buf[64];
+            ulog_info_msg_t *info = (ulog_info_msg_t *)info_buf;
+            info->header.msg_size = 0;  /* Will be set below */
+            info->header.msg_type = ULOG_MSG_INFO;
+            info->key_len = 10;  /* "sys_name\0" */
+            const char *key_val = "sys_name\0ESP_BBOX";
+            memcpy(info->key_value, key_val, 17);
+            info->header.msg_size = 1 + 17;  /* key_len + key/value */
+
+            size_t info_size = sizeof(ulog_msg_header_t) + 1 + 17;
+            written = fwrite(info, 1, info_size, s_blackbox.current_file);
+            if (written != info_size)
+            {
+                ESP_LOGE(TAG, "Failed to write ULog info message");
+                return ESP_FAIL;
+            }
+            atomic_fetch_add(&s_blackbox.current_file_size, written);
+            break;
+        }
+
+        case BLACKBOX_FORMAT_ARDUPILOT:
+        {
+            /* ArduPilot DataFlash: Write FMT message for FMT itself */
+            dataflash_fmt_msg_t fmt_fmt = {0};
+            fmt_fmt.header.head1 = DATAFLASH_HEAD_BYTE1;
+            fmt_fmt.header.head2 = DATAFLASH_HEAD_BYTE2;
+            fmt_fmt.header.msg_id = DF_MSG_FORMAT;
+            fmt_fmt.type = DF_MSG_FORMAT;
+            fmt_fmt.length = sizeof(dataflash_fmt_msg_t);
+            strncpy(fmt_fmt.name, "FMT", sizeof(fmt_fmt.name));
+            strncpy(fmt_fmt.format, "BBnNZ", sizeof(fmt_fmt.format));
+            strncpy(fmt_fmt.labels, "Type,Length,Name,Format,Columns", sizeof(fmt_fmt.labels));
+
+            written = fwrite(&fmt_fmt, 1, sizeof(fmt_fmt), s_blackbox.current_file);
+            if (written != sizeof(fmt_fmt))
+            {
+                ESP_LOGE(TAG, "Failed to write DataFlash FMT header");
+                return ESP_FAIL;
+            }
+            atomic_fetch_add(&s_blackbox.current_file_size, written);
+            break;
+        }
+
+        case BLACKBOX_FORMAT_BBOX:
+        default:
+        {
+            /* Native BBOX format header */
+            blackbox_file_header_t header = {0};
+
+            header.magic[0] = BLACKBOX_LOG_MAGIC_BYTE0;
+            header.magic[1] = BLACKBOX_LOG_MAGIC_BYTE1;
+            header.magic[2] = BLACKBOX_LOG_MAGIC_BYTE2;
+            header.magic[3] = BLACKBOX_LOG_MAGIC_BYTE3;
+            header.version = BLACKBOX_LOG_VERSION;
+            header.flags = s_blackbox.config.encrypt ? 0x01 : 0x00;
+            header.header_size = sizeof(blackbox_file_header_t);
+            header.timestamp_us = esp_timer_get_time();
+
+            /* Get device MAC as identifier */
+            uint8_t mac[6];
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            snprintf(header.device_id, sizeof(header.device_id),
+                     "%02X%02X%02X%02X%02X%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+            /* Write header directly (not encrypted) */
+            written = fwrite(&header, 1, sizeof(header), s_blackbox.current_file);
+            if (written != sizeof(header))
+            {
+                ESP_LOGE(TAG, "Failed to write file header");
+                return ESP_FAIL;
+            }
+
+            atomic_fetch_add(&s_blackbox.current_file_size, written);
+
+            /* If encrypted, also write the IV after the header */
+            if (s_blackbox.config.encrypt)
+            {
+                written = fwrite(s_blackbox.iv, 1, sizeof(s_blackbox.iv), s_blackbox.current_file);
+                if (written != sizeof(s_blackbox.iv))
+                {
+                    ESP_LOGE(TAG, "Failed to write IV");
+                    return ESP_FAIL;
+                }
+                atomic_fetch_add(&s_blackbox.current_file_size, written);
+
+                /* Reset cipher for new file with fresh IV */
+                mbedtls_cipher_reset(&s_blackbox.cipher_ctx);
+                mbedtls_cipher_set_iv(&s_blackbox.cipher_ctx, s_blackbox.iv, sizeof(s_blackbox.iv));
+            }
+            break;
+        }
     }
+
+    /* Reset format context for new file (clears format definitions written flag) */
+    bbox_format_ctx_init(&s_blackbox.format_ctx, (bbox_log_format_t)s_blackbox.config.log_format);
 
     return ESP_OK;
 }
@@ -712,8 +972,9 @@ static esp_err_t write_packet_to_file(const blackbox_packet_t *packet, size_t pa
         }
     }
 
-    /* Check if rotation is needed */
-    if (s_blackbox.current_file_size + packet_size > s_blackbox.config.file_size_limit)
+    /* Check if rotation is needed (atomic read for thread safety) */
+    size_t current_size = atomic_load(&s_blackbox.current_file_size);
+    if (current_size + packet_size > s_blackbox.config.file_size_limit)
     {
         esp_err_t ret = create_new_log_file();
         if (ret != ESP_OK)
@@ -742,7 +1003,7 @@ static esp_err_t write_packet_to_file(const blackbox_packet_t *packet, size_t pa
         {
             ESP_LOGE(TAG, "Write failed: expected %u, wrote %u",
                      (unsigned)packet_size, (unsigned)written);
-            if (xSemaphoreTake(s_blackbox.stats_mutex, portMAX_DELAY) == pdTRUE)
+            if (xSemaphoreTake(s_blackbox.stats_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
                 s_blackbox.stats.write_errors++;
                 xSemaphoreGive(s_blackbox.stats_mutex);
@@ -751,9 +1012,9 @@ static esp_err_t write_packet_to_file(const blackbox_packet_t *packet, size_t pa
         }
     }
 
-    s_blackbox.current_file_size += written;
+    atomic_fetch_add(&s_blackbox.current_file_size, written);
 
-    if (xSemaphoreTake(s_blackbox.stats_mutex, portMAX_DELAY) == pdTRUE)
+    if (xSemaphoreTake(s_blackbox.stats_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
     {
         s_blackbox.stats.bytes_written += written;
         xSemaphoreGive(s_blackbox.stats_mutex);
@@ -801,8 +1062,9 @@ static void close_current_file(void)
         fflush(s_blackbox.current_file);
         fclose(s_blackbox.current_file);
         s_blackbox.current_file = NULL;
+        size_t final_size = atomic_load(&s_blackbox.current_file_size);
         ESP_LOGI(TAG, "Closed log file: %s (size: %u bytes)",
-                 s_blackbox.current_file_path, (unsigned)s_blackbox.current_file_size);
+                 s_blackbox.current_file_path, (unsigned)final_size);
     }
 }
 
@@ -817,25 +1079,29 @@ static void writer_task(void *arg)
     TickType_t last_flush = xTaskGetTickCount();
     const TickType_t flush_interval = pdMS_TO_TICKS(s_blackbox.config.flush_interval_ms);
 
-    while (!s_blackbox.shutdown_requested)
+    while (!atomic_load(&s_blackbox.shutdown_requested))
     {
         /* Wait for flush signal or timeout */
         xSemaphoreTake(s_blackbox.flush_sem, flush_interval);
 
-        /* Process all items in the ring buffer */
+        /* Process all items in the ring buffer (protected by file mutex) */
         size_t item_size;
         void *item;
 
         while ((item = xRingbufferReceive(s_blackbox.ring_buffer, &item_size, 0)) != NULL)
         {
-            /* Write to file */
-            write_packet_to_file((const blackbox_packet_t *)item, item_size);
+            /* Write to file (file operations are protected internally) */
+            if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                write_packet_to_file((const blackbox_packet_t *)item, item_size);
+                xSemaphoreGive(s_blackbox.file_mutex);
+            }
 
             /* Return item to ring buffer */
             vRingbufferReturnItem(s_blackbox.ring_buffer, item);
 
             /* Check for shutdown during processing */
-            if (s_blackbox.shutdown_requested)
+            if (atomic_load(&s_blackbox.shutdown_requested))
             {
                 break;
             }
@@ -845,9 +1111,13 @@ static void writer_task(void *arg)
         TickType_t now = xTaskGetTickCount();
         if ((now - last_flush) >= flush_interval)
         {
-            if (s_blackbox.current_file != NULL)
+            if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
             {
-                fflush(s_blackbox.current_file);
+                if (s_blackbox.current_file != NULL)
+                {
+                    fflush(s_blackbox.current_file);
+                }
+                xSemaphoreGive(s_blackbox.file_mutex);
             }
             last_flush = now;
         }
@@ -860,15 +1130,25 @@ static void writer_task(void *arg)
     void *item;
     while ((item = xRingbufferReceive(s_blackbox.ring_buffer, &item_size, 0)) != NULL)
     {
-        write_packet_to_file((const blackbox_packet_t *)item, item_size);
+        if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            write_packet_to_file((const blackbox_packet_t *)item, item_size);
+            xSemaphoreGive(s_blackbox.file_mutex);
+        }
         vRingbufferReturnItem(s_blackbox.ring_buffer, item);
     }
 
-    /* Close file */
-    close_current_file();
+    /* Close file (protected by mutex) */
+    if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(1000)) == pdTRUE)
+    {
+        close_current_file();
+        xSemaphoreGive(s_blackbox.file_mutex);
+    }
 
     ESP_LOGI(TAG, "Writer task exiting");
 
+    /* Signal completion before deleting task */
+    xSemaphoreGive(s_blackbox.task_done_sem);
     s_blackbox.writer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -902,8 +1182,11 @@ esp_err_t blackbox_rotate_file(void)
     /* Flush first */
     blackbox_flush();
 
-    /* Force file size over limit to trigger rotation */
-    s_blackbox.current_file_size = s_blackbox.config.file_size_limit + 1;
+    /* Force file size over limit to trigger rotation (thread-safe atomic store) */
+    atomic_store(&s_blackbox.current_file_size, s_blackbox.config.file_size_limit + 1);
+
+    /* Trigger another flush to process the rotation */
+    xSemaphoreGive(s_blackbox.flush_sem);
 
     return ESP_OK;
 }
@@ -1043,6 +1326,10 @@ static void write_panic_packet_direct(blackbox_msg_type_t msg_type, const char *
     /* Copy payload */
     memcpy(packet.payload, data, payload_len);
 
+    /* Calculate CRC-16 for data integrity */
+    size_t crc_data_len = sizeof(blackbox_header_t) - sizeof(uint16_t) + payload_len;
+    packet.header.crc16 = calculate_crc16((const uint8_t *)&packet, crc_data_len);
+
     /* Calculate total size */
     size_t packet_size = sizeof(blackbox_header_t) + payload_len;
 
@@ -1152,8 +1439,8 @@ static void blackbox_shutdown_handler(void)
             for (int i = 0; i < dump_size / (words_per_line * 4); i++)
             {
                 uint32_t addr = (uint32_t)(uintptr_t)ptr;
-                /* Simple bounds check - may not be perfect in panic context */
-                if (addr >= 0x3FF00000 && addr < 0x40000000)
+                /* SOC-agnostic memory validation using ESP-IDF helpers */
+                if (esp_ptr_internal((const void *)ptr) || esp_ptr_external_ram((const void *)ptr))
                 {
                     len = snprintf(panic_buf, sizeof(panic_buf),
                                    "%08x: %08x %08x %08x %08x",
@@ -1180,8 +1467,11 @@ static void blackbox_shutdown_handler(void)
         /* Note: fsync/fdatasync might not work in panic context on all platforms */
     }
 
-    /* Also flush any remaining ring buffer data */
-    blackbox_flush();
+    /* 
+     * NOTE: We intentionally do NOT call blackbox_flush() here because it uses
+     * FreeRTOS primitives (xSemaphoreGive, vTaskDelay) which are unsafe in panic
+     * context when the scheduler may be stopped.
+     */
 }
 
 /*******************************************************************************
@@ -1299,4 +1589,329 @@ esp_err_t blackbox_log_test_panic(const char *reason)
     }
 
     return ESP_OK;
+}
+
+/*******************************************************************************
+ * Structured Message Logging Implementation
+ ******************************************************************************/
+
+/**
+ * @brief Struct message packet for ring buffer
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t magic[4];         /**< Magic bytes */
+    uint8_t version;          /**< Version */
+    uint8_t msg_type;         /**< Message type (BBOX_MSG_*) */
+    uint8_t format;           /**< Log format (bbox_log_format_t) */
+    uint8_t reserved;         /**< Reserved */
+    uint64_t timestamp_us;    /**< Timestamp */
+    uint16_t data_size;       /**< Size of data following this header */
+    uint16_t crc16;           /**< CRC-16 checksum */
+    uint8_t data[];           /**< Message data */
+} struct_packet_header_t;
+
+#define STRUCT_PACKET_MAGIC_BYTE0 0x53  /* 'S' */
+#define STRUCT_PACKET_MAGIC_BYTE1 0x54  /* 'T' */
+#define STRUCT_PACKET_MAGIC_BYTE2 0x52  /* 'R' */
+#define STRUCT_PACKET_MAGIC_BYTE3 0x55  /* 'U' */
+
+/**
+ * @brief Write format definition for PX4 ULog
+ */
+static esp_err_t write_ulog_format_def(bbox_msg_id_t msg_id)
+{
+    if (s_blackbox.format_ctx.format_written[msg_id]) {
+        return ESP_OK;  /* Already written */
+    }
+
+    const char *format_str = bbox_get_ulog_format(msg_id);
+    if (format_str == NULL) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /* Build format message */
+    uint8_t buf[300];
+    ulog_msg_header_t *header = (ulog_msg_header_t *)buf;
+    size_t format_len = strlen(format_str);
+    
+    header->msg_type = ULOG_MSG_FORMAT;
+    header->msg_size = format_len;
+    
+    memcpy(buf + sizeof(ulog_msg_header_t), format_str, format_len);
+    
+    size_t total_size = sizeof(ulog_msg_header_t) + format_len;
+    
+    if (s_blackbox.current_file != NULL) {
+        fwrite(buf, 1, total_size, s_blackbox.current_file);
+        atomic_fetch_add(&s_blackbox.current_file_size, total_size);
+    }
+    
+    s_blackbox.format_ctx.format_written[msg_id] = true;
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Write format definition for ArduPilot DataFlash
+ */
+static esp_err_t write_dataflash_format_def(bbox_msg_id_t msg_id)
+{
+    if (s_blackbox.format_ctx.format_written[msg_id]) {
+        return ESP_OK;  /* Already written */
+    }
+
+    dataflash_fmt_msg_t fmt_msg;
+    memset(&fmt_msg, 0, sizeof(fmt_msg));
+    
+    fmt_msg.header.head1 = DATAFLASH_HEAD_BYTE1;
+    fmt_msg.header.head2 = DATAFLASH_HEAD_BYTE2;
+    fmt_msg.header.msg_id = DF_MSG_FORMAT;
+    fmt_msg.type = (uint8_t)msg_id;
+    
+    char name[5], format[17], labels[65];
+    bbox_get_dataflash_format(msg_id, name, format, labels);
+    
+    strncpy(fmt_msg.name, name, 4);
+    strncpy(fmt_msg.format, format, 16);
+    strncpy(fmt_msg.labels, labels, 64);
+    
+    /* Calculate message length */
+    fmt_msg.length = sizeof(dataflash_fmt_msg_t);
+    
+    if (s_blackbox.current_file != NULL) {
+        fwrite(&fmt_msg, 1, sizeof(fmt_msg), s_blackbox.current_file);
+        atomic_fetch_add(&s_blackbox.current_file_size, sizeof(fmt_msg));
+    }
+    
+    s_blackbox.format_ctx.format_written[msg_id] = true;
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Write struct data in PX4 ULog format
+ */
+static esp_err_t write_struct_ulog(bbox_msg_id_t msg_id, const void *data, size_t size)
+{
+    /* Ensure format is written */
+    write_ulog_format_def(msg_id);
+    
+    /* Build data message */
+    uint8_t buf[512];
+    ulog_data_header_t *header = (ulog_data_header_t *)buf;
+    
+    header->header.msg_type = ULOG_MSG_DATA;
+    header->header.msg_size = sizeof(uint16_t) + size;
+    header->msg_id = s_blackbox.format_ctx.next_msg_id;
+    
+    memcpy(buf + sizeof(ulog_data_header_t), data, size);
+    
+    size_t total_size = sizeof(ulog_data_header_t) + size;
+    
+    if (s_blackbox.current_file != NULL) {
+        fwrite(buf, 1, total_size, s_blackbox.current_file);
+        atomic_fetch_add(&s_blackbox.current_file_size, total_size);
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Write struct data in ArduPilot DataFlash format
+ */
+static esp_err_t write_struct_dataflash(bbox_msg_id_t msg_id, const void *data, size_t size)
+{
+    /* Ensure format is written */
+    write_dataflash_format_def(msg_id);
+    
+    /* Build data message */
+    uint8_t buf[512];
+    dataflash_msg_header_t *header = (dataflash_msg_header_t *)buf;
+    
+    header->head1 = DATAFLASH_HEAD_BYTE1;
+    header->head2 = DATAFLASH_HEAD_BYTE2;
+    header->msg_id = (uint8_t)msg_id;
+    
+    memcpy(buf + sizeof(dataflash_msg_header_t), data, size);
+    
+    size_t total_size = sizeof(dataflash_msg_header_t) + size;
+    
+    if (s_blackbox.current_file != NULL) {
+        fwrite(buf, 1, total_size, s_blackbox.current_file);
+        atomic_fetch_add(&s_blackbox.current_file_size, total_size);
+    }
+    
+    return ESP_OK;
+}
+
+/**
+ * @brief Write struct data in native BBOX format
+ */
+static esp_err_t write_struct_bbox(bbox_msg_id_t msg_id, const void *data, size_t size)
+{
+    /* Build BBOX struct packet */
+    uint8_t buf[512];
+    struct_packet_header_t *header = (struct_packet_header_t *)buf;
+    
+    header->magic[0] = STRUCT_PACKET_MAGIC_BYTE0;
+    header->magic[1] = STRUCT_PACKET_MAGIC_BYTE1;
+    header->magic[2] = STRUCT_PACKET_MAGIC_BYTE2;
+    header->magic[3] = STRUCT_PACKET_MAGIC_BYTE3;
+    header->version = BLACKBOX_LOG_VERSION;
+    header->msg_type = (uint8_t)msg_id;
+    header->format = BLACKBOX_FORMAT_BBOX;
+    header->reserved = 0;
+    header->timestamp_us = esp_timer_get_time();
+    header->data_size = (uint16_t)size;
+    
+    memcpy(buf + sizeof(struct_packet_header_t), data, size);
+    
+    /* Calculate CRC */
+    size_t crc_len = sizeof(struct_packet_header_t) - sizeof(uint16_t) + size;
+    header->crc16 = calculate_crc16(buf, crc_len);
+    
+    size_t total_size = sizeof(struct_packet_header_t) + size;
+    
+    if (s_blackbox.current_file != NULL) {
+        if (s_blackbox.config.encrypt) {
+            encrypt_and_write(buf, total_size);
+        } else {
+            fwrite(buf, 1, total_size, s_blackbox.current_file);
+        }
+        atomic_fetch_add(&s_blackbox.current_file_size, total_size);
+    }
+    
+    return ESP_OK;
+}
+
+esp_err_t blackbox_log_struct(bbox_msg_id_t msg_id, const void *data, size_t size)
+{
+    if (!s_blackbox.initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    if (data == NULL || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (!atomic_load(&s_blackbox.file_output)) {
+        return ESP_OK;  /* File output disabled */
+    }
+    
+    esp_err_t ret = ESP_OK;
+    
+    /* Take file mutex for direct write */
+    if (xSemaphoreTake(s_blackbox.file_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        atomic_fetch_add(&s_blackbox.messages_dropped, 1);
+        return ESP_ERR_TIMEOUT;
+    }
+    
+    /* Ensure file is open */
+    if (s_blackbox.current_file == NULL) {
+        ret = create_new_log_file();
+        if (ret != ESP_OK) {
+            xSemaphoreGive(s_blackbox.file_mutex);
+            return ret;
+        }
+    }
+    
+    /* Check file rotation */
+    size_t current_size = atomic_load(&s_blackbox.current_file_size);
+    if (current_size + size + 32 > s_blackbox.config.file_size_limit) {
+        ret = create_new_log_file();
+        if (ret != ESP_OK) {
+            xSemaphoreGive(s_blackbox.file_mutex);
+            return ret;
+        }
+    }
+    
+    /* Write based on format */
+    switch (s_blackbox.config.log_format) {
+        case BLACKBOX_FORMAT_PX4_ULOG:
+            ret = write_struct_ulog(msg_id, data, size);
+            break;
+        case BLACKBOX_FORMAT_ARDUPILOT:
+            ret = write_struct_dataflash(msg_id, data, size);
+            break;
+        case BLACKBOX_FORMAT_BBOX:
+        default:
+            ret = write_struct_bbox(msg_id, data, size);
+            break;
+    }
+    
+    xSemaphoreGive(s_blackbox.file_mutex);
+    
+    if (ret == ESP_OK) {
+        atomic_fetch_add(&s_blackbox.struct_messages_logged, 1);
+    }
+    
+    return ret;
+}
+
+/* Convenience functions for specific message types */
+
+esp_err_t blackbox_log_imu(const bbox_msg_imu_t *imu)
+{
+    return blackbox_log_struct(BBOX_MSG_IMU, imu, sizeof(bbox_msg_imu_t));
+}
+
+esp_err_t blackbox_log_gps(const bbox_msg_gps_t *gps)
+{
+    return blackbox_log_struct(BBOX_MSG_GPS, gps, sizeof(bbox_msg_gps_t));
+}
+
+esp_err_t blackbox_log_attitude(const bbox_msg_attitude_t *att)
+{
+    return blackbox_log_struct(BBOX_MSG_ATTITUDE, att, sizeof(bbox_msg_attitude_t));
+}
+
+esp_err_t blackbox_log_pid(bbox_msg_id_t axis, const bbox_msg_pid_t *pid)
+{
+    if (axis < BBOX_MSG_PID_ROLL || axis > BBOX_MSG_PID_ALT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return blackbox_log_struct(axis, pid, sizeof(bbox_msg_pid_t));
+}
+
+esp_err_t blackbox_log_motor(const bbox_msg_motor_t *motor)
+{
+    return blackbox_log_struct(BBOX_MSG_MOTOR, motor, sizeof(bbox_msg_motor_t));
+}
+
+esp_err_t blackbox_log_battery(const bbox_msg_battery_t *battery)
+{
+    return blackbox_log_struct(BBOX_MSG_BATTERY, battery, sizeof(bbox_msg_battery_t));
+}
+
+esp_err_t blackbox_log_rc_input(const bbox_msg_rc_input_t *rc)
+{
+    return blackbox_log_struct(BBOX_MSG_RC_INPUT, rc, sizeof(bbox_msg_rc_input_t));
+}
+
+esp_err_t blackbox_log_status(const bbox_msg_status_t *status)
+{
+    return blackbox_log_struct(BBOX_MSG_STATUS, status, sizeof(bbox_msg_status_t));
+}
+
+esp_err_t blackbox_log_baro(const bbox_msg_baro_t *baro)
+{
+    return blackbox_log_struct(BBOX_MSG_BARO, baro, sizeof(bbox_msg_baro_t));
+}
+
+esp_err_t blackbox_log_mag(const bbox_msg_mag_t *mag)
+{
+    return blackbox_log_struct(BBOX_MSG_MAG, mag, sizeof(bbox_msg_mag_t));
+}
+
+esp_err_t blackbox_log_esc(const bbox_msg_esc_t *esc)
+{
+    return blackbox_log_struct(BBOX_MSG_ESC, esc, sizeof(bbox_msg_esc_t));
+}
+
+blackbox_log_format_t blackbox_get_log_format(void)
+{
+    if (!s_blackbox.initialized) {
+        return BLACKBOX_FORMAT_BBOX;
+    }
+    return s_blackbox.config.log_format;
 }

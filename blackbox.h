@@ -1,17 +1,18 @@
 /**
  * @file blackbox.h
- * @brief ULog Logger Library for ESP-IDF
+ * @brief Flight Data Logger Library for ESP-IDF
  *
- * A logging library with:
- * - Blackbox binary format
+ * A high-performance logging library with:
+ * - Multiple format support: BBOX, PX4 ULog, ArduPilot DataFlash
+ * - Structured message logging (IMU, GPS, PID, Motor, etc.)
  * - Console (ESP_LOG) + file output
  * - Lock-free ring buffer for non-blocking writes
- * - Optional AES encryption
+ * - Optional AES encryption (BBOX format)
  * - Automatic file rotation
  * - Component tags, file, line, timestamp
  *
  * @author Nikhil Robinson
- * @version 1.0.0
+ * @version 2.0.0
  */
 
 #ifndef LOGGER_H
@@ -22,6 +23,7 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include "esp_err.h"
+#include "blackbox_messages.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -173,6 +175,19 @@ extern "C"
     } blackbox_level_t;
 
     /*******************************************************************************
+     * Log Format Selection
+     ******************************************************************************/
+
+    /**
+     * @brief Supported log file formats
+     */
+    typedef enum {
+        BLACKBOX_FORMAT_BBOX = 0,      /**< Native BBOX binary format (.blackbox) */
+        BLACKBOX_FORMAT_PX4_ULOG = 1,  /**< PX4 ULog format (.ulg) */
+        BLACKBOX_FORMAT_ARDUPILOT = 2, /**< ArduPilot DataFlash format (.bin) */
+    } blackbox_log_format_t;
+
+    /*******************************************************************************
      * Configuration Structure
      ******************************************************************************/
 
@@ -186,7 +201,7 @@ extern "C"
     {
         const char *root_path;      /**< Root path for log files (e.g., "/sdcard/logs" or "/spiffs/logs") */
         const char *file_prefix;    /**< Log file prefix (default: "flight") */
-        bool encrypt;               /**< Enable AES encryption */
+        bool encrypt;               /**< Enable AES encryption (BBOX format only) */
         uint8_t encryption_key[32]; /**< AES-256 encryption key (if encrypt=true) */
         size_t file_size_limit;     /**< File size limit for rotation (bytes) */
         size_t buffer_size;         /**< Ring buffer size (bytes, min 16KB) */
@@ -194,6 +209,16 @@ extern "C"
         blackbox_level_t min_level; /**< Minimum log level to record */
         bool console_output;        /**< Enable console output via ESP_LOG */
         bool file_output;           /**< Enable file output */
+
+        /**
+         * @brief Log file format
+         * 
+         * Select the output format:
+         * - BLACKBOX_FORMAT_BBOX: Native binary format (default)
+         * - BLACKBOX_FORMAT_PX4_ULOG: PX4-compatible ULog format
+         * - BLACKBOX_FORMAT_ARDUPILOT: ArduPilot DataFlash format
+         */
+        blackbox_log_format_t log_format;
 
         /**
          * @brief Panic handler flags (32-bit bitmask)
@@ -230,6 +255,7 @@ extern "C"
         uint32_t file_hash;      /**< Source file name hash */
         uint16_t line;           /**< Source line number */
         uint16_t payload_length; /**< Payload length */
+        uint16_t crc16;          /**< CRC-16 checksum of header + payload */
     } blackbox_header_t;
 
     /**
@@ -456,7 +482,174 @@ extern "C"
     esp_err_t blackbox_log_test_panic(const char *reason);
 
 /*******************************************************************************
- * Logging Macros (Primary API)
+ * Structured Message Logging API
+ ******************************************************************************/
+
+/**
+ * @brief Log a structured message
+ * 
+ * Logs a binary struct with automatic format encoding based on the
+ * configured log format (BBOX, PX4 ULog, or ArduPilot DataFlash).
+ *
+ * @param msg_id Message type ID (from bbox_msg_id_t)
+ * @param data Pointer to the message struct
+ * @param size Size of the message struct in bytes
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_struct(bbox_msg_id_t msg_id, const void *data, size_t size);
+
+/**
+ * @brief Log IMU sensor data
+ * 
+ * @param imu Pointer to IMU data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_imu(const bbox_msg_imu_t *imu);
+
+/**
+ * @brief Log GPS position data
+ * 
+ * @param gps Pointer to GPS data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_gps(const bbox_msg_gps_t *gps);
+
+/**
+ * @brief Log attitude data
+ * 
+ * @param att Pointer to attitude data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_attitude(const bbox_msg_attitude_t *att);
+
+/**
+ * @brief Log PID controller state
+ * 
+ * @param axis PID axis (BBOX_MSG_PID_ROLL, BBOX_MSG_PID_PITCH, BBOX_MSG_PID_YAW, BBOX_MSG_PID_ALT)
+ * @param pid Pointer to PID data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_pid(bbox_msg_id_t axis, const bbox_msg_pid_t *pid);
+
+/**
+ * @brief Log motor outputs
+ * 
+ * @param motor Pointer to motor data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_motor(const bbox_msg_motor_t *motor);
+
+/**
+ * @brief Log battery status
+ * 
+ * @param battery Pointer to battery data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_battery(const bbox_msg_battery_t *battery);
+
+/**
+ * @brief Log RC input channels
+ * 
+ * @param rc Pointer to RC input data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_rc_input(const bbox_msg_rc_input_t *rc);
+
+/**
+ * @brief Log system status
+ * 
+ * @param status Pointer to status data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_status(const bbox_msg_status_t *status);
+
+/**
+ * @brief Log barometer data
+ * 
+ * @param baro Pointer to barometer data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_baro(const bbox_msg_baro_t *baro);
+
+/**
+ * @brief Log magnetometer data
+ * 
+ * @param mag Pointer to magnetometer data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_mag(const bbox_msg_mag_t *mag);
+
+/**
+ * @brief Log ESC telemetry data
+ * 
+ * @param esc Pointer to ESC data struct
+ * @return esp_err_t ESP_OK on success
+ */
+esp_err_t blackbox_log_esc(const bbox_msg_esc_t *esc);
+
+/**
+ * @brief Get current log format
+ * 
+ * @return blackbox_log_format_t Current log format
+ */
+blackbox_log_format_t blackbox_get_log_format(void);
+
+/*******************************************************************************
+ * Convenience Macros for Struct Logging
+ ******************************************************************************/
+
+/**
+ * @brief Log IMU data with automatic timestamp
+ */
+#define BLACKBOX_LOG_IMU(ax, ay, az, gx, gy, gz, temp, id) do { \
+    bbox_msg_imu_t _imu = { \
+        .timestamp_us = esp_timer_get_time(), \
+        .accel_x = (ax), .accel_y = (ay), .accel_z = (az), \
+        .gyro_x = (gx), .gyro_y = (gy), .gyro_z = (gz), \
+        .temperature = (temp), .imu_id = (id) \
+    }; \
+    blackbox_log_imu(&_imu); \
+} while(0)
+
+/**
+ * @brief Log attitude data with automatic timestamp
+ */
+#define BLACKBOX_LOG_ATTITUDE(r, p, y, rr, pr, yr) do { \
+    bbox_msg_attitude_t _att = { \
+        .timestamp_us = esp_timer_get_time(), \
+        .roll = (r), .pitch = (p), .yaw = (y), \
+        .rollspeed = (rr), .pitchspeed = (pr), .yawspeed = (yr) \
+    }; \
+    blackbox_log_attitude(&_att); \
+} while(0)
+
+/**
+ * @brief Log PID state with automatic timestamp
+ */
+#define BLACKBOX_LOG_PID(axis_id, sp, meas, err, p, i, d, ff, out) do { \
+    bbox_msg_pid_t _pid = { \
+        .timestamp_us = esp_timer_get_time(), \
+        .setpoint = (sp), .measured = (meas), .error = (err), \
+        .p_term = (p), .i_term = (i), .d_term = (d), \
+        .ff_term = (ff), .output = (out), .axis = (axis_id) \
+    }; \
+    blackbox_log_pid(BBOX_MSG_PID_ROLL + (axis_id), &_pid); \
+} while(0)
+
+/**
+ * @brief Log motor outputs with automatic timestamp
+ */
+#define BLACKBOX_LOG_MOTOR(m1, m2, m3, m4, count, armed_flag) do { \
+    bbox_msg_motor_t _mot = { \
+        .timestamp_us = esp_timer_get_time(), \
+        .motor = {(m1), (m2), (m3), (m4), 0, 0, 0, 0}, \
+        .motor_count = (count), .armed = (armed_flag) \
+    }; \
+    blackbox_log_motor(&_mot); \
+} while(0)
+
+/*******************************************************************************
+ * Text Logging Macros (Primary API)
  ******************************************************************************/
 
 /**
