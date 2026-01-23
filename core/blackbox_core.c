@@ -467,9 +467,18 @@ static size_t encode_message(
             
             /* Write FMT message if first time seeing this message type */
             if (!s_bbox.encoder.format_written[msg_type]) {
+                /* Write FMT message */
                 size_t fmt_size = bbox_encode_dataflash_fmt(
                     buffer + offset, msg_type, msg_length, name, format, labels);
                 offset += fmt_size;
+                
+                /* Write FMTU message for Mission Planner compatibility */
+                const char *unit_ids, *mult_ids;
+                if (bbox_get_dataflash_fmtu_info(msg_type, &unit_ids, &mult_ids)) {
+                    offset += bbox_encode_dataflash_fmtu(
+                        buffer + offset, timestamp, msg_type, unit_ids, mult_ids);
+                }
+                
                 s_bbox.encoder.format_written[msg_type] = true;
             }
             
@@ -676,7 +685,7 @@ static bbox_err_t create_new_log_file(void)
 static bbox_err_t write_file_header(void)
 {
     const bbox_hal_t *hal = s_bbox.hal;
-    uint8_t header_buf[128];
+    uint8_t header_buf[512];  /* Larger buffer for ArduPilot FMT+FMTU headers */
     size_t header_size = 0;
     
     switch (s_bbox.config.log_format) {
@@ -686,10 +695,29 @@ static bbox_err_t write_file_header(void)
         }
         
         case BBOX_FORMAT_ARDUPILOT: {
-            /* Write FMT message for FMT itself */
-            header_size = bbox_encode_dataflash_fmt(
-                header_buf, DF_MSG_FORMAT, sizeof(dataflash_fmt_msg_t),
+            /* Write complete ArduPilot DataFlash header for Mission Planner compatibility */
+            uint64_t timestamp = hal->get_time_us();
+            size_t offset = 0;
+            
+            /* 1. FMT message for FMT itself */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_FORMAT, sizeof(dataflash_fmt_msg_t),
                 "FMT", "BBnNZ", "Type,Length,Name,Format,Columns");
+            
+            /* 2. FMT message for FMTU (Format Units) - required by Mission Planner */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_FMTU, sizeof(dataflash_fmtu_msg_t),
+                "FMTU", "QBNN", "TimeUS,FmtType,UnitIds,MultIds");
+            
+            /* 3. FMTU data for FMTU itself */
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_FMTU, "s---", "F---");
+            
+            /* 4. FMTU data for FMT */
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_FORMAT, "-----", "-----");
+            
+            header_size = offset;
             break;
         }
         

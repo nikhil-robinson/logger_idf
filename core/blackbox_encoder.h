@@ -66,6 +66,7 @@ typedef struct __attribute__((packed)) {
 
 typedef enum {
     DF_MSG_FORMAT   = 0x80,  /* Must be 128 */
+    DF_MSG_FMTU     = 0x76,  /* Format Units - required for Mission Planner */
     DF_MSG_PARM     = 0x20,  /* Parameters */
     DF_MSG_GPS      = 0x21,
     DF_MSG_IMU      = 0x22,
@@ -101,6 +102,18 @@ typedef struct __attribute__((packed)) {
     char format[16];
     char labels[64];
 } dataflash_fmt_msg_t;
+
+/**
+ * @brief ArduPilot FMTU (Format Units) message structure
+ * Required for Mission Planner compatibility
+ */
+typedef struct __attribute__((packed)) {
+    dataflash_msg_header_t header;
+    uint64_t timestamp_us;
+    uint8_t fmt_type;       /* Message type this applies to */
+    char unit_ids[16];      /* Unit IDs (s=seconds, d=degrees, etc.) */
+    char mult_ids[16];      /* Multiplier IDs (F=1e-6, etc.) */
+} dataflash_fmtu_msg_t;
 
 /**
  * @brief ArduPilot PID message structure (matches ArduPilot log_PID)
@@ -350,6 +363,37 @@ static inline size_t bbox_encode_dataflash_fmt(
 }
 
 /**
+ * @brief Encode FMTU (Format Units) message for Mission Planner compatibility
+ */
+static inline size_t bbox_encode_dataflash_fmtu(
+    uint8_t *buffer,
+    uint64_t timestamp,
+    uint8_t fmt_type,
+    const char *unit_ids,
+    const char *mult_ids)
+{
+    dataflash_fmtu_msg_t *fmtu = (dataflash_fmtu_msg_t *)buffer;
+    
+    fmtu->header.head1 = DATAFLASH_HEAD_BYTE1;
+    fmtu->header.head2 = DATAFLASH_HEAD_BYTE2;
+    fmtu->header.msg_id = DF_MSG_FMTU;
+    fmtu->timestamp_us = timestamp;
+    fmtu->fmt_type = fmt_type;
+    
+    memset(fmtu->unit_ids, 0, sizeof(fmtu->unit_ids));
+    memset(fmtu->mult_ids, 0, sizeof(fmtu->mult_ids));
+    
+    if (unit_ids) {
+        strncpy(fmtu->unit_ids, unit_ids, sizeof(fmtu->unit_ids) - 1);
+    }
+    if (mult_ids) {
+        strncpy(fmtu->mult_ids, mult_ids, sizeof(fmtu->mult_ids) - 1);
+    }
+    
+    return sizeof(dataflash_fmtu_msg_t);
+}
+
+/**
  * @brief Write DataFlash message header
  */
 static inline void bbox_encode_dataflash_header(uint8_t *buffer, uint8_t msg_id)
@@ -573,6 +617,80 @@ static inline bool bbox_get_dataflash_fmt_info(
             
         default:
             return false;
+    }
+}
+
+/**
+ * @brief Get FMTU (Format Units) info for a message type
+ * Unit IDs: s=seconds, d=degrees, m=meters, n=m/s, o=m/s/s, etc.
+ * Mult IDs: -=1, F=1e-6 (micros to seconds), 0=1, 2=1e-2 (centi), etc.
+ */
+static inline bool bbox_get_dataflash_fmtu_info(
+    uint8_t msg_type,
+    const char **unit_ids,
+    const char **mult_ids)
+{
+    switch (msg_type) {
+        case DF_MSG_FORMAT:
+            *unit_ids = "-----";
+            *mult_ids = "-----";
+            return true;
+            
+        case DF_MSG_FMTU:
+            *unit_ids = "s---";
+            *mult_ids = "F---";
+            return true;
+            
+        case DF_MSG_ATT:
+            *unit_ids = "sddd---";
+            *mult_ids = "F000---";
+            return true;
+            
+        case DF_MSG_PIDR:
+        case DF_MSG_PIDP:
+        case DF_MSG_PIDY:
+        case DF_MSG_PIDA:
+            /* PID: TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags */
+            *unit_ids = "s----------";
+            *mult_ids = "F----------";
+            return true;
+            
+        case DF_MSG_IMU:
+            /* IMU: TimeUS,GyrX,GyrY,GyrZ,AccX,AccY,AccZ,I,T */
+            *unit_ids = "sEEEooo-O";
+            *mult_ids = "F000000-0";
+            return true;
+            
+        case DF_MSG_GPS:
+            *unit_ids = "s--DUmmnnn-nn";
+            *mult_ids = "F--EEBBCCC-00";
+            return true;
+            
+        case DF_MSG_BARO:
+            *unit_ids = "sPmO-";
+            *mult_ids = "F00C-";
+            return true;
+            
+        case DF_MSG_MAG:
+            *unit_ids = "sGGGO-";
+            *mult_ids = "F0000-";
+            return true;
+            
+        case DF_MSG_BAT:
+            *unit_ids = "svoA%------O-";
+            *mult_ids = "F??0B------0-";
+            return true;
+            
+        case DF_MSG_MOT:
+            *unit_ids = "s--------%%";
+            *mult_ids = "F--------00";
+            return true;
+            
+        default:
+            /* Default: no units */
+            *unit_ids = "s---------------";
+            *mult_ids = "F---------------";
+            return true;
     }
 }
 
