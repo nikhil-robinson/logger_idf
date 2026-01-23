@@ -4,13 +4,15 @@ This folder contains example applications demonstrating different use cases of t
 
 ## Examples Overview
 
-| Example | Storage | Encryption | Use Case |
-|---------|---------|------------|----------|
-| [flight_data_example](flight_data_example/) | SPIFFS | No | **NEW** Structured IMU/GPS/PID/Motor logging |
-| [spiffs_example](spiffs_example/) | SPIFFS | No | Internal flash logging, small logs |
-| [sdcard_example](sdcard_example/) | SD Card | No | High-throughput flight data logging |
-| [encryption_example](encryption_example/) | SD Card | AES-256 | Secure sensitive data logging |
-| [panic_example](panic_example/) | SD Card | No | Crash/coredump logging demonstration |
+| Example | Storage | Format | Use Case |
+|---------|---------|--------|----------|
+| [flight_data_example](flight_data_example/) | SPIFFS | BBOX | Structured IMU/GPS/PID/Motor logging |
+| [px4_spiffs_example](px4_spiffs_example/) | SPIFFS | **PX4 ULog** | QGroundControl/FlightPlot compatible logs |
+| [ardupilot_spiffs_example](ardupilot_spiffs_example/) | SPIFFS | **ArduPilot** | Mission Planner compatible logs |
+| [spiffs_example](spiffs_example/) | SPIFFS | BBOX | Internal flash logging, small logs |
+| [sdcard_example](sdcard_example/) | SD Card | BBOX | High-throughput flight data logging |
+| [encryption_example](encryption_example/) | SD Card | BBOX+AES | Secure sensitive data logging |
+| [panic_example](panic_example/) | SD Card | BBOX | Crash/coredump logging demonstration |
 
 ---
 
@@ -199,6 +201,82 @@ blackbox_init(&config);  // That's it!
 
 ---
 
+## 6. PX4 ULog SPIFFS Example
+
+**Location:** `examples/px4_spiffs_example/`
+
+Demonstrates PX4 ULog format logging to SPIFFS internal flash.
+
+### Features
+- **PX4 ULog format** (`.ulg` files)
+- Compatible with QGroundControl, FlightPlot, PlotJuggler
+- Simulated PX4-style flight data
+- Flight mode simulation (ARM → POSCTL → LOITER → RTL → LAND)
+- ESC telemetry logging
+
+### Best For
+- PX4 ecosystem integration
+- QGroundControl log analysis
+- pyulog scripting and automation
+- Research data in standard format
+
+### Configuration
+```c
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+config.root_path = "/spiffs/logs";
+config.file_prefix = "px4_";
+config.log_format = BLACKBOX_FORMAT_PX4_ULOG;
+blackbox_init(&config);
+```
+
+### Analysis with pyulog
+```bash
+pip install pyulog
+ulog_info your_log.ulg
+ulog2csv -m sensor_combined your_log.ulg
+```
+
+---
+
+## 7. ArduPilot DataFlash SPIFFS Example
+
+**Location:** `examples/ardupilot_spiffs_example/`
+
+Demonstrates ArduPilot DataFlash format logging to SPIFFS internal flash.
+
+### Features
+- **ArduPilot DataFlash format** (`.bin` files)
+- Compatible with Mission Planner, MAVExplorer
+- Simulated ArduCopter-style flight data
+- RC input and motor output logging
+- Barometer and magnetometer data
+
+### Best For
+- ArduPilot ecosystem integration
+- Mission Planner log review
+- Existing ArduPilot analysis workflows
+- Comparison with actual flight logs
+
+### Configuration
+```c
+blackbox_config_t config;
+blackbox_get_default_config(&config);
+config.root_path = "/spiffs/logs";
+config.file_prefix = "ardu";
+config.log_format = BLACKBOX_FORMAT_ARDUPILOT;
+blackbox_init(&config);
+```
+
+### Analysis with MAVExplorer
+```bash
+pip install pymavlink
+mavlogdump.py --types IMU,GPS,ATT your_log.bin
+mavgraph.py your_log.bin "IMU.AccX" "IMU.AccY"
+```
+
+---
+
 ## Building an Example
 
 1. Navigate to the example directory:
@@ -255,13 +333,21 @@ dependencies:
 
 ---
 
-## Log File Format
+## Log File Formats
 
-All examples produce `.blackbox` binary log files with:
-- 4-byte magic header: `ULog` (0x55 0x4C 0x6F 0x67)
+Examples produce different formats based on `config.log_format`:
+
+| Format | Extension | Description |
+|--------|-----------|-------------|
+| `BLACKBOX_FORMAT_BBOX` | `.blackbox` | Native format with optional AES-256 encryption |
+| `BLACKBOX_FORMAT_PX4_ULOG` | `.ulg` | PX4 ULog for QGroundControl, FlightPlot |
+| `BLACKBOX_FORMAT_ARDUPILOT` | `.bin` | ArduPilot DataFlash for Mission Planner |
+
+### Native BBOX Format
+- 4-byte magic header: `BBOX` (0x42 0x42 0x4F 0x58)
 - File header with device ID and creation timestamp
 - Binary log packets with timestamps, levels, and messages
-- Optional AES-256-CTR encryption
+- Optional AES-256-CTR encryption (only in BBOX format)
 
 ---
 
