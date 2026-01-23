@@ -401,8 +401,10 @@ void bbox_log_va(bbox_log_level_t level, const char *tag, const char *file,
         va_end(args_copy);
     }
     
-    /* File output */
-    if (s_bbox.file_output) {
+    /* File output - skip for binary-only formats (ArduPilot, ULog) */
+    if (s_bbox.file_output && 
+        s_bbox.config.log_format != BBOX_FORMAT_ARDUPILOT &&
+        s_bbox.config.log_format != BBOX_FORMAT_PX4_ULOG) {
         bbox_packet_t packet;
         uint64_t timestamp = s_bbox.hal->get_time_us();
         
@@ -427,6 +429,102 @@ void bbox_log_va(bbox_log_level_t level, const char *tag, const char *file,
  * Structured Message Logging
  ******************************************************************************/
 
+/**
+ * @brief Encode a message in the current format
+ */
+static size_t encode_message(
+    uint8_t *buffer,
+    size_t buffer_size,
+    bbox_msg_id_t msg_id,
+    uint64_t timestamp,
+    const void *data,
+    size_t size)
+{
+    switch (s_bbox.config.log_format) {
+        case BBOX_FORMAT_ARDUPILOT: {
+            /* ArduPilot DataFlash format */
+            const char *name, *format, *labels;
+            uint8_t msg_type;
+            
+            if (!bbox_get_dataflash_fmt_info(msg_id, &name, &format, &labels, &msg_type)) {
+                return 0;
+            }
+            
+            /* Get message size for FMT record */
+            uint8_t msg_length = 0;
+            if (msg_id == BBOX_MSG_PID_ROLL || msg_id == BBOX_MSG_PID_PITCH || 
+                msg_id == BBOX_MSG_PID_YAW || msg_id == BBOX_MSG_PID_ALT) {
+                msg_length = sizeof(dataflash_pid_msg_t);
+            } else if (msg_id == BBOX_MSG_ATTITUDE) {
+                msg_length = sizeof(dataflash_att_msg_t);
+            } else if (msg_id == BBOX_MSG_IMU) {
+                msg_length = sizeof(dataflash_imu_msg_t);
+            } else {
+                msg_length = 3 + size;  /* header + raw data */
+            }
+            
+            size_t offset = 0;
+            
+            /* Write FMT message if first time seeing this message type */
+            if (!s_bbox.encoder.format_written[msg_type]) {
+                size_t fmt_size = bbox_encode_dataflash_fmt(
+                    buffer + offset, msg_type, msg_length, name, format, labels);
+                offset += fmt_size;
+                s_bbox.encoder.format_written[msg_type] = true;
+            }
+            
+            /* Encode based on message type */
+            if (msg_id == BBOX_MSG_PID_ROLL || msg_id == BBOX_MSG_PID_PITCH || 
+                msg_id == BBOX_MSG_PID_YAW || msg_id == BBOX_MSG_PID_ALT) {
+                const bbox_msg_pid_t *pid = (const bbox_msg_pid_t *)data;
+                size_t msg_size = bbox_encode_dataflash_pid(
+                    buffer + offset, buffer_size - offset,
+                    msg_type, timestamp,
+                    pid->setpoint, pid->measured, pid->error,
+                    pid->p_term, pid->i_term, pid->d_term,
+                    pid->ff_term, pid->output, pid->axis);
+                return offset + msg_size;
+            }
+            else if (msg_id == BBOX_MSG_ATTITUDE) {
+                const bbox_msg_attitude_t *att = (const bbox_msg_attitude_t *)data;
+                size_t msg_size = bbox_encode_dataflash_att(
+                    buffer + offset, buffer_size - offset,
+                    timestamp, att->roll, att->pitch, att->yaw,
+                    att->rollspeed, att->pitchspeed, att->yawspeed);
+                return offset + msg_size;
+            }
+            else if (msg_id == BBOX_MSG_IMU) {
+                const bbox_msg_imu_t *imu = (const bbox_msg_imu_t *)data;
+                size_t msg_size = bbox_encode_dataflash_imu(
+                    buffer + offset, buffer_size - offset,
+                    timestamp,
+                    imu->accel_x, imu->accel_y, imu->accel_z,
+                    imu->gyro_x, imu->gyro_y, imu->gyro_z,
+                    imu->temperature, imu->imu_id);
+                return offset + msg_size;
+            }
+            else {
+                /* Generic: just write header + raw data */
+                if (buffer_size - offset < 3 + size) {
+                    return 0;
+                }
+                bbox_encode_dataflash_header(buffer + offset, msg_type);
+                offset += 3;
+                memcpy(buffer + offset, data, size);
+                return offset + size;
+            }
+        }
+        
+        case BBOX_FORMAT_PX4_ULOG:
+            /* TODO: Proper ULog encoding with message definitions */
+            /* Fall through to BBOX for now */
+            
+        case BBOX_FORMAT_BBOX:
+        default:
+            return bbox_encode_struct_packet(buffer, buffer_size, msg_id, timestamp, data, size);
+    }
+}
+
 bbox_err_t bbox_log_struct(bbox_msg_id_t msg_id, const void *data, size_t size)
 {
     if (!s_bbox.initialized) {
@@ -441,12 +539,11 @@ bbox_err_t bbox_log_struct(bbox_msg_id_t msg_id, const void *data, size_t size)
         return BBOX_OK;
     }
     
-    /* Encode struct packet */
+    /* Encode message in appropriate format */
     uint8_t buffer[512];
     uint64_t timestamp = s_bbox.hal->get_time_us();
     
-    size_t packet_size = bbox_encode_struct_packet(
-        buffer, sizeof(buffer), msg_id, timestamp, data, size);
+    size_t packet_size = encode_message(buffer, sizeof(buffer), msg_id, timestamp, data, size);
     
     if (packet_size == 0) {
         return BBOX_ERR_BUFFER_FULL;
