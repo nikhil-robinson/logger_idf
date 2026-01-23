@@ -19,15 +19,15 @@ A portable, high-performance flight data logging library with Hardware Abstracti
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     Your Application                         │
+│                     Your Application                        │
 ├─────────────────────────────────────────────────────────────┤
-│                      blackbox.h (API)                        │
+│                      blackbox.h (API)                       │
 ├─────────────────────────────────────────────────────────────┤
 │   core/blackbox_core.c     │     core/blackbox_encoder.h    │
-│   (Platform Independent)    │     (Format Encoders)          │
+│   (Platform Independent)    │     (Format Encoders)         │
 ├─────────────────────────────────────────────────────────────┤
-│                     hal/blackbox_hal.h                       │
-│                    (HAL Interface)                           │
+│                     hal/blackbox_hal.h                      │
+│                    (HAL Interface)                          │
 ├──────────────────┬──────────────────┬───────────────────────┤
 │  hal_esp.c       │  hal_posix.c     │  hal_yourplatform.c   │
 │  (ESP-IDF)       │  (Linux/macOS)   │  (Your Port)          │
