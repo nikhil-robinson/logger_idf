@@ -1,5 +1,5 @@
-version: "2.0.0"
-description: High-performance flight data recorder for ESP32 drones and robotics. Features structured IMU/GPS/PID/Motor logging, PX4 ULog and ArduPilot DataFlash format support, lock-free ring buffer, optional AES-256 encryption.
+version: "3.0.0"
+description: Portable flight data logger with HAL architecture. Features structured IMU/GPS/PID/Motor logging, PX4 ULog and ArduPilot DataFlash formats, lock-free ring buffer, optional encryption. Supports ESP-IDF, Linux, macOS.
 url: https://github.com/nikhil-robinson/blackbox
 repository: https://github.com/nikhil-robinson/blackbox.git
 documentation: https://github.com/nikhil-robinson/blackbox

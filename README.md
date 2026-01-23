@@ -1,764 +1,314 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/ESP--IDF-V5.2%2B-blue?&logo=espressif" alt="ESP-IDF">
-  <img src="https://img.shields.io/badge/License-BSD3-green?" alt="License">
-  <img src="https://img.shields.io/badge/Version-2.0.0-orange?" alt="Version">
-</p>
+# Blackbox Flight Data Logger
 
-<h1 align="center">🛫 Blackbox Logger for ESP-IDF</h1>
+[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](https://github.com/nikhil/blackbox)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-<p align="center">
-  <strong>A high-performance flight data recorder for ESP32 drones and robotics</strong>
-</p>
+A portable, high-performance flight data logging library with Hardware Abstraction Layer (HAL) architecture.
 
-<p align="center">
-  <a href="#-features">Features</a> •
-  <a href="#-installation">Installation</a> •
-  <a href="#-quick-start">Quick Start</a> •
-  <a href="#-structured-logging">Struct Logging</a> •
-  <a href="#-examples">Examples</a> •
-  <a href="#-api-reference">API</a> •
-  <a href="#-tools">Tools</a>
-</p>
+## Features
 
----
+- **🔌 Platform Independent**: HAL architecture enables easy porting to any platform
+- **📊 Multiple Formats**: BBOX (native), PX4 ULog (.ulg), ArduPilot DataFlash (.bin)
+- **⚡ High Performance**: Lock-free ring buffer, background writing
+- **🔒 Optional Encryption**: AES-256-CTR for sensitive data (platform dependent)
+- **📝 Structured Logging**: Built-in support for IMU, GPS, PID, Motor, Battery, etc.
+- **📄 Text Logging**: Printf-style logging with tags and levels
+- **🖥️ Desktop Testing**: Test on Linux/macOS before deploying to hardware
 
-## 📋 Table of Contents
+## Architecture
 
-- [Features](#-features)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start)
-- [Structured Flight Data Logging](#-structured-flight-data-logging)
-- [Log Formats](#-log-formats)
-- [Examples](#-examples)
-- [Configuration](#-configuration)
-- [API Reference](#-api-reference)
-- [Binary Log Format](#-binary-log-format)
-- [Tools](#-tools)
-- [Architecture](#-architecture)
-- [Performance](#-performance)
-- [Troubleshooting](#-troubleshooting)
-- [Contributing](#-contributing)
-- [License](#-license)
-
----
-
-## ✨ Features
-
-| Feature | Description |
-|---------|-------------|
-| 🚀 **Non-blocking API** | Lock-free ring buffer ensures zero latency in tight control loops |
-| 🛸 **Structured Flight Data** | Native support for IMU, GPS, PID, Motor, Battery, and more |
-| 📺 **Multi-Format Output** | PX4 ULog (.ulg), ArduPilot DataFlash (.bin), or native BBOX format |
-| 🔐 **AES-256 Encryption** | Optional encryption for secure, tamper-proof logs |
-| 🔄 **Auto File Rotation** | Automatic file rotation based on configurable size limits |
-| 🏷️ **Component Tags** | Organize logs by subsystem (IMU, MOTOR, GPS, etc.) |
-| 📍 **Full Context** | Every log includes file name, line number, and microsecond timestamp |
-| 💾 **Filesystem Agnostic** | Works with SD card, SPIFFS, LittleFS, or any mounted filesystem |
-| ⚡ **Thread-Safe** | Safe to call from multiple tasks and cores simultaneously |
-| 📊 **Statistics** | Track messages logged, dropped, bytes written, and more |
-| 💥 **Panic Logging** | Capture crash information, backtraces, and register dumps to file |
-
----
-
-## 📦 Installation
-
-### Using ESP-IDF Component Manager (Recommended)
-
-Add to your project's `idf_component.yml`:
-
-```yaml
-dependencies:
-  nikhil-robinson/blackbox:
-    git: https://github.com/nikhil-robinson/blackbox.git
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Your Application                         │
+├─────────────────────────────────────────────────────────────┤
+│                      blackbox.h (API)                        │
+├─────────────────────────────────────────────────────────────┤
+│   core/blackbox_core.c     │     core/blackbox_encoder.h    │
+│   (Platform Independent)    │     (Format Encoders)          │
+├─────────────────────────────────────────────────────────────┤
+│                     hal/blackbox_hal.h                       │
+│                    (HAL Interface)                           │
+├──────────────────┬──────────────────┬───────────────────────┤
+│  hal_esp.c       │  hal_posix.c     │  hal_yourplatform.c   │
+│  (ESP-IDF)       │  (Linux/macOS)   │  (Your Port)          │
+└──────────────────┴──────────────────┴───────────────────────┘
 ```
 
-Then run:
-```bash
-idf.py reconfigure
-```
+## Quick Start
 
-### Manual Installation
-
-Clone into your project's `components` directory:
-
-```bash
-cd your_project/components
-git clone https://github.com/nikhil-robinson/blackbox.git blackbox
-```
-
-### Dependencies
-
-- ESP-IDF V5.2 or later
-- mbedTLS (included in ESP-IDF, required for encryption)
-
----
-
-## 🚀 Quick Start
+### ESP-IDF (ESP32)
 
 ```c
 #include "blackbox.h"
+#include "hal/blackbox_hal_esp.h"
 
 void app_main(void)
 {
-    // 1. Mount your filesystem first (SD card, SPIFFS, etc.)
-    //    The logger never mounts filesystems - you must do that
-    init_sdcard();  // Your code
-    
-    // 2. Configure the logger
-    blackbox_config_t config;
-    blackbox_get_default_config(&config);
-    config.root_path = "/sdcard/logs";
-    config.file_prefix = "sensor";
-    config.min_level = BLACKBOX_LOG_LEVEL_INFO;
-    
-    // 3. Initialize
-    ESP_ERROR_CHECK(blackbox_init(&config));
-    
-    // 4. Start logging!
-    BLACKBOX_LOG_INFO("MAIN", "System initialized, firmware v1.0.0");
-    BLACKBOX_LOG_WARN("IMU", "Calibration drift: %.2f degrees", 0.5f);
-    BLACKBOX_LOG_ERROR("MOTOR", "ESC #2 communication timeout!");
-    
-    // 5. Your application loop
-    while (1) {
-        float altitude = get_altitude();
-        BLACKBOX_LOG_DEBUG("NAV", "Altitude: %.2f m", altitude);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    
-    // 6. Cleanup (optional, flushes remaining data)
-    blackbox_deinit();
+    // Get the ESP-IDF HAL
+    const bbox_hal_t *hal = bbox_hal_esp_get();
+
+    // Configure
+    bbox_config_t config;
+    bbox_get_default_config(&config);
+    config.root_path = "/spiffs/logs";
+    config.log_format = BBOX_FORMAT_PX4_ULOG;
+
+    // Initialize
+    bbox_init(&config, hal);
+
+    // Log text messages
+    BBOX_LOG_I("MAIN", "System initialized");
+
+    // Log structured data
+    bbox_msg_imu_t imu = {
+        .timestamp_us = hal->get_time_us(),
+        .accel_x = 0.1f, .accel_y = 0.2f, .accel_z = -9.81f,
+        .gyro_x = 0.01f, .gyro_y = 0.02f, .gyro_z = 0.0f,
+        .temperature = 25.0f,
+        .imu_id = 0
+    };
+    bbox_log_imu(&imu);
+
+    // Cleanup
+    bbox_deinit();
 }
 ```
 
----
-
-## � Structured Flight Data Logging
-
-Version 2.0 adds native support for structured flight controller data with industry-standard format compatibility.
-
-### Supported Message Types
-
-| Message Type | Struct | Rate | Description |
-|--------------|--------|------|-------------|
-| IMU | `bbox_msg_imu_t` | 100-1000 Hz | Gyroscope, accelerometer, temperature |
-| GPS | `bbox_msg_gps_t` | 1-10 Hz | Position, altitude, fix status, satellites |
-| Attitude | `bbox_msg_attitude_t` | 50-200 Hz | Roll, pitch, yaw (Euler angles) |
-| PID | `bbox_msg_pid_t` | 50-500 Hz | Controller state per axis |
-| Motor | `bbox_msg_motor_t` | 50-500 Hz | PWM outputs (up to 8 channels) |
-| Battery | `bbox_msg_battery_t` | 1-10 Hz | Voltage, current, capacity, temperature |
-| RC Input | `bbox_msg_rc_input_t` | 50 Hz | Radio control channel values |
-| Barometer | `bbox_msg_baro_t` | 10-50 Hz | Pressure, altitude, temperature |
-| Magnetometer | `bbox_msg_mag_t` | 10-100 Hz | 3-axis magnetic field |
-| ESC Telemetry | `bbox_msg_esc_t` | 10-50 Hz | Individual ESC data |
-| Status | `bbox_msg_status_t` | 1-10 Hz | Flight mode, arm state, errors |
-
-### Basic Usage
+### Desktop (Linux/macOS)
 
 ```c
 #include "blackbox.h"
-#include "blackbox_messages.h"
+#include "hal/blackbox_hal_posix.h"
 
-// Log IMU data at 100 Hz
-void imu_task(void *arg) {
-    bbox_msg_imu_t imu;
-    
-    while (1) {
-        // Read from your IMU hardware
-        imu.timestamp_us = esp_timer_get_time();
-        mpu6050_read(&imu.accel_x, &imu.accel_y, &imu.accel_z,
-                     &imu.gyro_x, &imu.gyro_y, &imu.gyro_z);
-        imu.temp = mpu6050_get_temp();
-        
-        // Log it (non-blocking)
-        blackbox_log_imu(&imu);
-        
-        vTaskDelay(pdMS_TO_TICKS(10));  // 100 Hz
-    }
-}
+int main(void)
+{
+    const bbox_hal_t *hal = bbox_hal_posix_get();
 
-// Log GPS data at 10 Hz
-void gps_task(void *arg) {
-    bbox_msg_gps_t gps;
-    
-    while (1) {
-        gps.timestamp_us = esp_timer_get_time();
-        gps.lat = gps_get_latitude() * 1e7;  // degrees * 1e7
-        gps.lon = gps_get_longitude() * 1e7;
-        gps.alt_mm = gps_get_altitude() * 1000;
-        gps.satellites = gps_get_sat_count();
-        gps.fix_type = gps_get_fix_type();
-        
-        blackbox_log_gps(&gps);
-        
-        vTaskDelay(pdMS_TO_TICKS(100));  // 10 Hz
-    }
+    bbox_config_t config;
+    bbox_get_default_config(&config);
+    config.root_path = "/tmp/logs";
+    config.encrypt = false;  // No encryption on POSIX
+
+    bbox_init(&config, hal);
+    BBOX_LOG_I("MAIN", "Hello from desktop!");
+    bbox_deinit();
+
+    return 0;
 }
 ```
 
----
+## Project Structure
 
-## 📄 Log Formats
+```
+blackbox/
+├── include/
+│   └── blackbox.h          # Public API header
+├── core/
+│   ├── blackbox_core.c     # Core implementation (platform independent)
+│   ├── blackbox_types.h    # Type definitions and enums
+│   ├── blackbox_messages.h # Structured message definitions
+│   ├── blackbox_encoder.h  # Format encoders
+│   └── blackbox_ringbuf.h  # Lock-free ring buffer
+├── hal/
+│   ├── blackbox_hal.h      # HAL interface definition
+│   ├── blackbox_hal_esp.c  # ESP-IDF implementation
+│   ├── blackbox_hal_esp.h
+│   ├── blackbox_hal_posix.c # Linux/macOS implementation
+│   ├── blackbox_hal_posix.h
+│   └── blackbox_hal_template.c # Template for new ports
+├── examples/
+│   ├── hal_example/        # ESP-IDF HAL example
+│   ├── posix_test/         # Desktop test program
+│   └── ...
+├── tools/
+│   ├── blackbox_decoder.py # Python log decoder
+│   └── README.md
+└── README.md
+```
 
-Choose the format that best fits your workflow:
+## HAL Interface
 
-| Format | Extension | Encryption | Use Case |
-|--------|-----------|------------|----------|
-| **BBOX Native** | `.blackbox` | ✅ AES-256 | Custom applications, secure logging |
-| **PX4 ULog** | `.ulg` | ❌ | PX4/QGroundControl ecosystem |
-| **ArduPilot DataFlash** | `.bin` | ❌ | Mission Planner, MAVExplorer |
+The HAL provides an abstraction layer between the core library and platform-specific code:
 
-### Format Selection
+### Required Functions (Must Implement)
+
+| Function | Purpose |
+|----------|---------|
+| `file_open` | Open file for writing |
+| `file_write` | Write data to file |
+| `file_sync` | Sync file to storage |
+| `file_close` | Close file |
+| `file_size` | Get current file size |
+| `get_time_us` | Get timestamp in microseconds |
+
+### Optional Functions (NULL if not available)
+
+| Function | Purpose |
+|----------|---------|
+| `mutex_*` | Thread-safe access |
+| `task_*` | Background writer task |
+| `sem_*` | Task synchronization |
+| `aes_*` | Encryption support |
+| `log_output` | Console debug output |
+| `malloc/free` | Custom allocator |
+| `get_device_id` | Unique device ID |
+
+## Operating Modes
+
+### Background Task Mode (Default)
 
 ```c
-blackbox_config_t config;
-blackbox_get_default_config(&config);
-
-// Option 1: Native format with encryption
-config.log_format = BLACKBOX_FORMAT_BBOX;
-config.encrypt = true;
-memcpy(config.encryption_key, my_key, 32);
-
-// Option 2: PX4 ULog for FlightPlot/QGroundControl
-config.log_format = BLACKBOX_FORMAT_PX4_ULOG;
-
-// Option 3: ArduPilot for Mission Planner
-config.log_format = BLACKBOX_FORMAT_ARDUPILOT;
-
-blackbox_init(&config);
+config.single_threaded = false;
 ```
 
-### Tool Compatibility
+A background task drains the ring buffer and writes to file. Best for real-time systems.
 
-**PX4 ULog (.ulg)**:
-- [QGroundControl](https://qgroundcontrol.com/) - Built-in log viewer
-- [FlightPlot](https://github.com/PX4/FlightPlot) - Java log plotter
-- [PlotJuggler](https://www.plotjuggler.io/) - Real-time visualization
-- [pyulog](https://github.com/PX4/pyulog) - Python parsing library
-
-**ArduPilot DataFlash (.bin)**:
-- [Mission Planner](https://ardupilot.org/planner/) - Log Review tab
-- [MAVExplorer](https://ardupilot.org/dev/docs/using-mavexplorer-for-log-analysis.html)
-- [UAV Log Viewer](https://plot.ardupilot.org/) - Web-based
-
-**BBOX Native (.blackbox)**:
-- `tools/blackbox_decoder.py` - Included Python decoder
-
----
-
-## 📚 Examples
-
-Complete working examples are provided in the [`examples/`](examples/) directory:
-
-| Example | Storage | Encryption | Description |
-|---------|---------|------------|-------------|
-| [**flight_data_example**](examples/flight_data_example/) | SPIFFS | ❌ | 🆕 Structured IMU/GPS/PID/Motor logging |
-| [**spiffs_example**](examples/spiffs_example/) | SPIFFS | ❌ | Internal flash logging for simple applications |
-| [**sdcard_example**](examples/sdcard_example/) | SD Card | ❌ | High-throughput logging for sensor controllers |
-| [**encryption_example**](examples/encryption_example/) | SD Card | ✅ | Secure logging with AES-256 encryption |
-| [**panic_example**](examples/panic_example/) | SD Card | ❌ | Crash/coredump logging with panic handler |
-
-### Running an Example
-
-```bash
-cd examples/sdcard_example
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
-```
-
----
-
-## ⚙️ Configuration
-
-### Configuration Structure
+### Polling Mode
 
 ```c
-typedef struct {
-    const char* root_path;          // Log directory path
-    const char* file_prefix;        // File name prefix
-    bool encrypt;                   // Enable AES-256 encryption (BBOX format only)
-    uint8_t encryption_key[32];     // 256-bit encryption key
-    size_t file_size_limit;         // File rotation size
-    size_t buffer_size;             // Ring buffer size
-    uint32_t flush_interval_ms;     // Flush interval
-    blackbox_level_t min_level;     // Minimum log level
-    bool console_output;            // Enable console output
-    bool file_output;               // Enable file output
-    
-    // Log format selection (new in v2.0)
-    blackbox_log_format_t log_format; // BLACKBOX_FORMAT_BBOX, _PX4_ULOG, or _ARDUPILOT
-    
-    // Panic handler configuration (32-bit flag bitmask)
-    uint32_t panic_flags;           // BLACKBOX_PANIC_FLAG_* bitmask
-} blackbox_config_t;
+config.single_threaded = true;
+
+// In your main loop:
+while (1) {
+    bbox_log_imu(&imu);
+    bbox_process();  // Call periodically to write data
+}
 ```
 
-### Panic Handler Flags
+No RTOS required. Good for bare-metal systems.
 
-| Flag | Value | Description |
-|------|-------|-------------|
-| `BLACKBOX_PANIC_FLAG_NONE` | `0x00000000` | No panic features enabled |
-| `BLACKBOX_PANIC_FLAG_ENABLED` | `0x00000001` | Enable panic handler |
-| `BLACKBOX_PANIC_FLAG_BACKTRACE` | `0x00000002` | Include stack backtrace |
-| `BLACKBOX_PANIC_FLAG_REGISTERS` | `0x00000004` | Include CPU register dump |
-| `BLACKBOX_PANIC_FLAG_MEMORY_DUMP` | `0x00000008` | Include memory dump around SP |
-| `BLACKBOX_PANIC_FLAG_TASK_INFO` | `0x00000010` | Include current task info |
-| `BLACKBOX_PANIC_FLAG_HEAP_INFO` | `0x00000020` | Include heap statistics |
-| `BLACKBOX_PANIC_FLAGS_DEFAULT` | `0x00000007` | Enabled + backtrace + registers |
-| `BLACKBOX_PANIC_FLAGS_ALL` | `0x0000003F` | All features enabled |
+## Log Formats
 
-### Example Panic Configuration
+| Format | Extension | Compatible With |
+|--------|-----------|-----------------|
+| BBOX | `.blackbox` | Python decoder |
+| PX4 ULog | `.ulg` | QGroundControl, FlightPlot, pyulog |
+| ArduPilot | `.bin` | Mission Planner, MAVExplorer |
+
+## Porting to New Platforms
+
+1. Copy `hal/blackbox_hal_template.c` to `hal/blackbox_hal_yourplatform.c`
+2. Implement required functions (file I/O, timestamp)
+3. Optionally implement threading and encryption
+4. Create your HAL getter function
+
+Example minimal HAL:
 
 ```c
-blackbox_config_t config;
-blackbox_get_default_config(&config);
+static bbox_file_t my_file_open(const char *path, bool append) {
+    return (bbox_file_t)fopen(path, append ? "ab" : "wb");
+}
 
-// Default: panic enabled with backtrace and registers
-// config.panic_flags == BLACKBOX_PANIC_FLAGS_DEFAULT
+static uint64_t my_get_time_us(void) {
+    return my_timer_read_us();  // Your timer function
+}
 
-// Enable all panic features
-config.panic_flags = BLACKBOX_PANIC_FLAGS_ALL;
+static const bbox_hal_t s_my_hal = {
+    .file_open = my_file_open,
+    .file_write = my_file_write,
+    .file_sync = my_file_sync,
+    .file_close = my_file_close,
+    .file_size = my_file_size,
+    .get_time_us = my_get_time_us,
+    // Set remaining to NULL
+};
 
-// Custom: only backtrace, no memory dump
-config.panic_flags = BLACKBOX_PANIC_FLAG_ENABLED | 
-                     BLACKBOX_PANIC_FLAG_BACKTRACE;
-
-// Disable panic handler entirely
-config.panic_flags = BLACKBOX_PANIC_FLAG_NONE;
+const bbox_hal_t *my_hal_get(void) {
+    return &s_my_hal;
+}
 ```
 
-### Configuration Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `root_path` | `const char*` | **Required** | Root path for log files (e.g., "/sdcard/logs") |
-| `file_prefix` | `const char*` | `"flight"` | Log file name prefix |
-| `encrypt` | `bool` | `false` | Enable AES-256-CTR encryption |
-| `encryption_key` | `uint8_t[32]` | - | 256-bit AES key (required if `encrypt=true`) |
-| `file_size_limit` | `size_t` | `512 KB` | File rotation size limit |
-| `buffer_size` | `size_t` | `32 KB` | Ring buffer size (minimum 16 KB) |
-| `flush_interval_ms` | `uint32_t` | `200 ms` | Periodic flush interval |
-| `min_level` | `blackbox_level_t` | `INFO` | Minimum log level to record |
-| `console_output` | `bool` | `true` | Mirror logs to ESP_LOG console |
-| `file_output` | `bool` | `true` | Write logs to binary file |
-| `panic_flags` | `uint32_t` | `0x07` | Panic handler flags (see table above) |
-
-### Kconfig Options (Compile-Time Constants)
-
-The following options can be configured via `idf.py menuconfig` under **Blackbox Logger Configuration**:
-
-#### Buffer and Memory Settings
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CONFIG_BLACKBOX_DEFAULT_BUFFER_SIZE` | `32` KB | Default ring buffer size |
-| `CONFIG_BLACKBOX_MIN_BUFFER_SIZE` | `16` KB | Minimum allowed buffer size |
-| `CONFIG_BLACKBOX_MAX_MESSAGE_SIZE` | `256` bytes | Maximum message payload size |
-
-#### File Settings
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CONFIG_BLACKBOX_DEFAULT_FILE_SIZE_LIMIT` | `512` KB | Default file rotation size |
-| `CONFIG_BLACKBOX_MAX_PATH_LENGTH` | `128` bytes | Maximum file path length |
-| `CONFIG_BLACKBOX_DEFAULT_FLUSH_INTERVAL` | `200` ms | Default flush interval |
-
-#### Task Settings
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CONFIG_BLACKBOX_WRITER_TASK_STACK_SIZE` | `4096` bytes | Writer task stack size |
-| `CONFIG_BLACKBOX_WRITER_TASK_PRIORITY` | `2` | Writer task FreeRTOS priority |
-
-#### Panic Handler Settings
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CONFIG_BLACKBOX_PANIC_MEMORY_DUMP_SIZE` | `256` bytes | Size of memory dump (64-1024) |
-
-### Log Levels
-
-| Level | Value | Macro | Use Case |
-|-------|-------|-------|----------|
-| `NONE` | 0 | - | Disable logging |
-| `ERROR` | 1 | `BLACKBOX_LOG_E` | Critical failures |
-| `WARN` | 2 | `BLACKBOX_LOG_W` | Warnings, degraded operation |
-| `INFO` | 3 | `BLACKBOX_LOG_I` | Normal operation events |
-| `DEBUG` | 4 | `BLACKBOX_LOG_D` | Debugging information |
-| `VERBOSE` | 5 | `BLACKBOX_LOG_V` | Detailed tracing |
-
----
-
-## 📖 API Reference
+## API Reference
 
 ### Initialization
 
 ```c
-// Get default configuration
-void blackbox_get_default_config(blackbox_config_t* config);
-
-// Initialize the logger
-esp_err_t blackbox_init(const blackbox_config_t* config);
-
-// Deinitialize (flushes remaining data)
-esp_err_t blackbox_deinit(void);
-
-// Check if initialized
-bool blackbox_is_initialized(void);
+bbox_err_t bbox_init(const bbox_config_t *config, const bbox_hal_t *hal);
+bbox_err_t bbox_deinit(void);
+bool bbox_is_initialized(void);
+void bbox_get_default_config(bbox_config_t *config);
 ```
 
-### Logging Macros
+### Text Logging
 
 ```c
-// Primary logging macros
-BLACKBOX_LOG_ERROR(tag, fmt, ...)   // Error level
-BLACKBOX_LOG_WARN(tag, fmt, ...)    // Warning level
-BLACKBOX_LOG_INFO(tag, fmt, ...)    // Info level
-BLACKBOX_LOG_DEBUG(tag, fmt, ...)   // Debug level
-BLACKBOX_LOG_VERBOSE(tag, fmt, ...) // Verbose level
+// Macros (recommended)
+BBOX_LOG_E(tag, fmt, ...);  // Error
+BBOX_LOG_W(tag, fmt, ...);  // Warning
+BBOX_LOG_I(tag, fmt, ...);  // Info
+BBOX_LOG_D(tag, fmt, ...);  // Debug
+BBOX_LOG_V(tag, fmt, ...);  // Verbose
 
-// Shorthand aliases
-BLACKBOX_LOG_E(tag, fmt, ...)
-BLACKBOX_LOG_W(tag, fmt, ...)
-BLACKBOX_LOG_I(tag, fmt, ...)
-BLACKBOX_LOG_D(tag, fmt, ...)
-BLACKBOX_LOG_V(tag, fmt, ...)
+// Direct function
+void bbox_log(bbox_log_level_t level, const char *tag, 
+              const char *file, uint32_t line, const char *fmt, ...);
 ```
 
-### Runtime Control
+### Structured Logging
 
 ```c
-// Force flush buffer to file
-esp_err_t blackbox_flush(void);
+bbox_err_t bbox_log_imu(const bbox_msg_imu_t *imu);
+bbox_err_t bbox_log_gps(const bbox_msg_gps_t *gps);
+bbox_err_t bbox_log_attitude(const bbox_msg_attitude_t *att);
+bbox_err_t bbox_log_pid(bbox_msg_id_t axis, const bbox_msg_pid_t *pid);
+bbox_err_t bbox_log_motor(const bbox_msg_motor_t *motor);
+bbox_err_t bbox_log_battery(const bbox_msg_battery_t *battery);
+bbox_err_t bbox_log_rc_input(const bbox_msg_rc_input_t *rc);
+bbox_err_t bbox_log_status(const bbox_msg_status_t *status);
+bbox_err_t bbox_log_baro(const bbox_msg_baro_t *baro);
+bbox_err_t bbox_log_mag(const bbox_msg_mag_t *mag);
+bbox_err_t bbox_log_esc(const bbox_msg_esc_t *esc);
 
-// Rotate to new log file immediately
-esp_err_t blackbox_rotate_file(void);
-
-// Set/get minimum log level
-esp_err_t blackbox_set_level(blackbox_level_t level);
-blackbox_level_t blackbox_get_level(void);
-
-// Enable/disable outputs at runtime
-esp_err_t blackbox_set_console_output(bool enable);
-esp_err_t blackbox_set_file_output(bool enable);
+// Generic struct logging
+bbox_err_t bbox_log_struct(bbox_msg_id_t msg_id, const void *data, size_t size);
 ```
 
-### Panic Handler (Optional)
+### Control
 
 ```c
-// Set panic flags at runtime (use BLACKBOX_PANIC_FLAG_* macros)
-esp_err_t blackbox_set_panic_flags(uint32_t flags);
-
-// Get current panic flags
-uint32_t blackbox_get_panic_flags(void);
-
-// Enable/disable panic handler (convenience wrapper)
-esp_err_t blackbox_set_panic_handler(bool enable);
-
-// Check if panic handler is enabled
-bool blackbox_is_panic_handler_enabled(void);
-
-// Log a test panic entry (for testing decoder)
-esp_err_t blackbox_log_test_panic(const char* reason);
+bbox_err_t bbox_flush(void);                     // Force flush to file
+bbox_err_t bbox_process(void);                   // Process ring buffer (polling mode)
+bbox_err_t bbox_rotate_file(void);               // Start new log file
+bbox_err_t bbox_set_level(bbox_log_level_t level);
+bbox_err_t bbox_set_console_output(bool enable);
+bbox_err_t bbox_set_file_output(bool enable);
+bbox_err_t bbox_get_stats(bbox_stats_t *stats);
 ```
 
-#### Runtime Panic Configuration Example
+## Decoding Logs
 
-```c
-// Enable all panic features at runtime
-blackbox_set_panic_flags(BLACKBOX_PANIC_FLAGS_ALL);
-
-// Disable only memory dump
-uint32_t flags = blackbox_get_panic_flags();
-flags &= ~BLACKBOX_PANIC_FLAG_MEMORY_DUMP;
-blackbox_set_panic_flags(flags);
-
-// Simple enable/disable
-blackbox_set_panic_handler(false);  // Disable
-blackbox_set_panic_handler(true);   // Re-enable (preserves other flags)
-```
-
-### Statistics
-
-```c
-typedef struct {
-    uint64_t messages_logged;    // Total messages logged
-    uint64_t messages_dropped;   // Messages dropped (buffer full)
-    uint64_t bytes_written;      // Total bytes written to file
-    uint32_t files_created;      // Number of log files created
-    uint32_t buffer_high_water;  // Buffer high water mark
-    uint32_t write_errors;       // File write errors
-} blackbox_stats_t;
-
-// Get statistics
-esp_err_t blackbox_get_stats(blackbox_stats_t* stats);
-
-// Reset statistics
-esp_err_t blackbox_reset_stats(void);
-```
-
----
-
-## 📄 Binary Log Format
-
-### File Structure
-
-```
-┌────────────────────────────────────────┐
-│         FILE HEADER (48 bytes)         │
-├────────────────────────────────────────┤
-│      IV (16 bytes) - if encrypted      │
-├────────────────────────────────────────┤
-│                                        │
-│            LOG PACKETS                 │
-│         (variable size each)           │
-│                                        │
-└────────────────────────────────────────┘
-```
-
-### File Header
-
-| Offset | Size | Field | Description |
-|--------|------|-------|-------------|
-| 0 | 4 | Magic | (0x42 0x4C 0x42 0x4F) |
-| 4 | 1 | Version | Format version (currently 1) |
-| 5 | 1 | Flags | Bit 0: encrypted |
-| 6 | 2 | Header Size | Size of this header |
-| 8 | 8 | Timestamp | File creation time (µs since boot) |
-| 16 | 32 | Device ID | Device MAC address |
-
-### Log Packet Header
-
-| Offset | Size | Field | Description |
-|--------|------|-------|-------------|
-| 0 | 4 | Magic | `"BLBO"` |
-| 4 | 1 | Version | Format version |
-| 5 | 1 | Msg Type | Message type (0x01 = LOG) |
-| 6 | 1 | Level | Log level (1-5) |
-| 7 | 1 | Reserved | Alignment padding |
-| 8 | 8 | Timestamp | Microseconds since boot |
-| 16 | 4 | Tag Hash | FNV-1a hash of tag string |
-| 20 | 4 | File Hash | FNV-1a hash of source file |
-| 24 | 2 | Line | Source line number |
-| 26 | 2 | Payload Len | Length of message payload |
-| 28 | N | Payload | UTF-8 message string |
-
-### Message Types
-
-| Type | Value | Description |
-|------|-------|-------------|
-| `LOG` | 0x01 | Standard log message |
-| `INFO` | 0x02 | Information message |
-| `MULTI` | 0x03 | Multi-part message |
-| `PARAM` | 0x04 | Parameter message |
-| `DATA` | 0x05 | Data message |
-| `DROPOUT` | 0x06 | Dropout marker |
-| `SYNC` | 0x07 | Sync message |
-| `PANIC` | 0x10 | Panic/crash information |
-| `BACKTRACE` | 0x11 | Backtrace data |
-| `COREDUMP` | 0x12 | Core dump marker |
-
-### Panic Log Data
-
-When panic logging is enabled, the following information is captured on crash:
-
-- **Panic Reason**: The cause of the crash (e.g., "LoadProhibited", "StoreProhibited", "InstrFetchProhibited")
-- **Core ID**: Which CPU core crashed
-- **Crash Address**: The memory address that caused the fault
-- **Backtrace**: Stack trace showing the call chain that led to the crash
-- **CPU Registers**: All general-purpose registers at crash time (PC, SP, A0-A15 for Xtensa; MEPC, RA, SP, etc. for RISC-V)
-- **Memory Dump** (optional): Memory contents around the stack pointer
-
----
-
-## 🔧 Tools
-
-### Python Log Decoder
-
-A Python tool is provided to decode and decrypt blackbox log files:
+Use the Python decoder to analyze log files:
 
 ```bash
-cd tools
-pip install -r requirements.txt
+# Basic decode
+python3 tools/blackbox_decoder.py flight_000001.blackbox
 
-# Decode unencrypted file
-python blackbox_decoder.py sensor001.blackbox
+# Structured data as JSON
+python3 tools/blackbox_decoder.py flight_000001.blackbox --struct --json
 
-# Decode encrypted file
-python blackbox_decoder.py secure001.blackbox \
-    --key 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
-
-# Export to CSV
-python blackbox_decoder.py flight001.blackbox --format csv --output logs.csv
-
-# Filter by level
-python blackbox_decoder.py flight001.blackbox --level ERROR --stats
+# Decrypt
+python3 tools/blackbox_decoder.py flight_000001.blackbox --key your_hex_key
 ```
 
-See [`tools/README.md`](tools/README.md) for full documentation.
+For PX4 ULog files, use standard tools:
 
----
+```bash
+# pyulog
+ulog_info flight.ulg
+ulog2csv flight.ulg
 
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    USER APPLICATION                         │
-│         BLACKBOX_LOG_INFO() / WARN() / ERROR()              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     FRONTEND API                            │
-│  • Formats binary BLBO packet                               │
-│  • Writes to lock-free ring buffer (non-blocking)           │
-│  • Mirrors to ESP_LOG console                               │
-│  • Atomic statistics updates                                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    RING BUFFER                              │
-│  • Lock-free, thread-safe                                   │
-│  • Configurable size (16-64 KB typical)                     │
-│  • Automatic overflow handling                              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│               LOG WRITER TASK (Background)                  │
-│  • Reads packets from ring buffer                           │
-│  • Optional AES-256-CTR encryption                          │
-│  • Writes to filesystem                                     │
-│  • Handles file rotation                                    │
-│  • Periodic flush                                           │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     FILESYSTEM                              │
-│            SD Card / SPIFFS / LittleFS                      │
-└─────────────────────────────────────────────────────────────┘
+# QGroundControl
+# File → Analyze Log
 ```
 
----
+## Migration from v2.0
 
-## ⚡ Performance
+See [MIGRATION.md](MIGRATION.md) for upgrading from the v2.0 ESP-IDF-only API.
 
-### Benchmarks (ESP32 @ 240 MHz)
+## License
 
-| Metric | Value |
-|--------|-------|
-| Log call latency | 5-10 µs (non-blocking) |
-| Maximum throughput | 50,000+ messages/sec |
-| Minimum buffer size | 16 KB |
-| Writer task stack | 4 KB |
-| Per-packet overhead | 28 bytes header |
+MIT License - see [LICENSE](LICENSE)
 
-### Design Principles
+## Author
 
-- **Zero blocking**: Log calls never wait for file I/O
-- **Lock-free**: No mutexes in the hot path
-- **Graceful degradation**: On buffer overflow, oldest messages are dropped (not newest)
-- **Atomic counters**: Statistics updated without locks
-
----
-
-## 🐛 Troubleshooting
-
-### Messages Being Dropped
-
-```c
-blackbox_stats_t stats;
-blackbox_get_stats(&stats);
-if (stats.messages_dropped > 0) {
-    // Increase buffer size or reduce log frequency
-    // config.buffer_size = 64 * 1024;
-}
-```
-
-**Solutions:**
-- Increase `buffer_size`
-- Decrease `flush_interval_ms`
-- Reduce logging frequency
-- Disable `console_output` for higher throughput
-
-### File Not Created
-
-- Ensure filesystem is mounted before calling `blackbox_init()`
-- Check that `root_path` directory exists or can be created
-- Verify sufficient storage space
-
-### Encryption Errors
-
-- Ensure `encryption_key` is exactly 32 bytes
-- Verify mbedTLS AES is enabled in sdkconfig:
-  ```
-  CONFIG_MBEDTLS_AES_C=y
-  CONFIG_MBEDTLS_CIPHER_MODE_CTR=y
-  ```
-
-### High CPU Usage
-
-- Increase `flush_interval_ms`
-- Reduce log level (`min_level`)
-- Disable `console_output`
-
----
-
-## 📁 Project Structure
-
-```
-blackbox/
-├── blackbox.c              # Library implementation
-├── blackbox.h              # Public API header
-├── CMakeLists.txt          # Component build configuration
-├── idf_component.yml       # Component manager manifest
-├── README.md               # This file
-│
-├── examples/
-│   ├── README.md           # Examples overview
-│   ├── spiffs_example/     # SPIFFS storage example
-│   ├── sdcard_example/     # SD card example
-│   └── encryption_example/ # AES encryption example
-│
-└── tools/
-    ├── README.md           # Tools documentation
-    ├── requirements.txt    # Python dependencies
-    └── blackbox_decoder.py # Log decoder script
-```
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Code Style
-
-- Follow existing code formatting
-- Add documentation for new functions
-- Include example usage where appropriate
-- Update README for significant changes
-
----
-
-## 📄 License
-
-This project is licensed under the BSD 3-Clause License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 👤 Author
-
-**Nikhil Robinson**
-
-- GitHub: [@nikhil-robinson](https://github.com/nikhil-robinson)
-
----
-
-<p align="center">
-  Made with ❤️ for the ESP32 community
-</p>
+Nikhil Robinson

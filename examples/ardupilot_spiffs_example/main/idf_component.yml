@@ -1,5 +1,0 @@
-dependencies:
-  idf: ">=5.2"
-  nikhil-robinson/blackbox:
-    version: "*"
-    override_path: "../../../"
