@@ -450,37 +450,11 @@ static size_t encode_message(
                 return 0;
             }
             
-            /* Get message size for FMT record */
-            uint8_t msg_length = 0;
-            if (msg_id == BBOX_MSG_PID_ROLL || msg_id == BBOX_MSG_PID_PITCH || 
-                msg_id == BBOX_MSG_PID_YAW || msg_id == BBOX_MSG_PID_ALT) {
-                msg_length = sizeof(dataflash_pid_msg_t);
-            } else if (msg_id == BBOX_MSG_ATTITUDE) {
-                msg_length = sizeof(dataflash_att_msg_t);
-            } else if (msg_id == BBOX_MSG_IMU) {
-                msg_length = sizeof(dataflash_imu_msg_t);
-            } else {
-                msg_length = 3 + size;  /* header + raw data */
-            }
+            /* NOTE: FMT/FMTU messages are written in write_file_header() for ArduPilot format.
+             * Do not write FMT inline here - it causes duplicates since encode_message()
+             * is called BEFORE the file is created and header is written. */
             
             size_t offset = 0;
-            
-            /* Write FMT message if first time seeing this message type */
-            if (!s_bbox.encoder.format_written[msg_type]) {
-                /* Write FMT message */
-                size_t fmt_size = bbox_encode_dataflash_fmt(
-                    buffer + offset, msg_type, msg_length, name, format, labels);
-                offset += fmt_size;
-                
-                /* Write FMTU message for Mission Planner compatibility */
-                const char *unit_ids, *mult_ids;
-                if (bbox_get_dataflash_fmtu_info(msg_type, &unit_ids, &mult_ids)) {
-                    offset += bbox_encode_dataflash_fmtu(
-                        buffer + offset, timestamp, msg_type, unit_ids, mult_ids);
-                }
-                
-                s_bbox.encoder.format_written[msg_type] = true;
-            }
             
             /* Encode based on message type */
             if (msg_id == BBOX_MSG_PID_ROLL || msg_id == BBOX_MSG_PID_PITCH || 
@@ -496,10 +470,18 @@ static size_t encode_message(
             }
             else if (msg_id == BBOX_MSG_ATTITUDE) {
                 const bbox_msg_attitude_t *att = (const bbox_msg_attitude_t *)data;
+                /* Convert rad to degrees for ArduPilot ATT format */
+                /* Use rollspeed/pitchspeed/yawspeed as desired values for PID correlation */
+                float roll_deg = att->roll * 57.2957795f;
+                float pitch_deg = att->pitch * 57.2957795f;
+                float yaw_deg = att->yaw * 57.2957795f;
+                /* For desired, use the rates as a proxy (or same as actual for now) */
+                float des_roll_deg = att->rollspeed * 57.2957795f;  /* Will be overwritten by example */
+                float des_pitch_deg = att->pitchspeed * 57.2957795f;
+                float des_yaw_deg = att->yawspeed * 57.2957795f;
                 size_t msg_size = bbox_encode_dataflash_att(
                     buffer + offset, buffer_size - offset,
-                    timestamp, att->roll, att->pitch, att->yaw,
-                    att->rollspeed, att->pitchspeed, att->yawspeed);
+                    timestamp, des_roll_deg, roll_deg, des_pitch_deg, pitch_deg, des_yaw_deg, yaw_deg);
                 return offset + msg_size;
             }
             else if (msg_id == BBOX_MSG_IMU) {
@@ -685,7 +667,7 @@ static bbox_err_t create_new_log_file(void)
 static bbox_err_t write_file_header(void)
 {
     const bbox_hal_t *hal = s_bbox.hal;
-    uint8_t header_buf[512];  /* Larger buffer for ArduPilot FMT+FMTU headers */
+    uint8_t header_buf[2048];  /* Large buffer for all ArduPilot FMT+FMTU headers */
     size_t header_size = 0;
     
     switch (s_bbox.config.log_format) {
@@ -695,7 +677,8 @@ static bbox_err_t write_file_header(void)
         }
         
         case BBOX_FORMAT_ARDUPILOT: {
-            /* Write complete ArduPilot DataFlash header for Mission Planner compatibility */
+            /* Write complete ArduPilot DataFlash header with ALL formats upfront */
+            /* This prevents duplicate FMT messages and ensures compatibility */
             uint64_t timestamp = hal->get_time_us();
             size_t offset = 0;
             
@@ -703,11 +686,13 @@ static bbox_err_t write_file_header(void)
             offset += bbox_encode_dataflash_fmt(
                 header_buf + offset, DF_MSG_FORMAT, sizeof(dataflash_fmt_msg_t),
                 "FMT", "BBnNZ", "Type,Length,Name,Format,Columns");
+            s_bbox.encoder.format_written[DF_MSG_FORMAT] = true;
             
             /* 2. FMT message for FMTU (Format Units) - required by Mission Planner */
             offset += bbox_encode_dataflash_fmt(
                 header_buf + offset, DF_MSG_FMTU, sizeof(dataflash_fmtu_msg_t),
                 "FMTU", "QBNN", "TimeUS,FmtType,UnitIds,MultIds");
+            s_bbox.encoder.format_written[DF_MSG_FMTU] = true;
             
             /* 3. FMTU data for FMTU itself */
             offset += bbox_encode_dataflash_fmtu(
@@ -716,6 +701,71 @@ static bbox_err_t write_file_header(void)
             /* 4. FMTU data for FMT */
             offset += bbox_encode_dataflash_fmtu(
                 header_buf + offset, timestamp, DF_MSG_FORMAT, "-----", "-----");
+            
+            /* 5. Pre-write FMT+FMTU for ATT */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_ATT, sizeof(dataflash_att_msg_t),
+                "ATT", "QffffffB", "TimeUS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw,AEKF");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_ATT, "sdddddd-", "F000000-");
+            s_bbox.encoder.format_written[DF_MSG_ATT] = true;
+            
+            /* 6. Pre-write FMT+FMTU for PIDR */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_PIDR, sizeof(dataflash_pid_msg_t),
+                "PIDR", "QffffffffffB", "TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_PIDR, "s----------", "F----------");
+            s_bbox.encoder.format_written[DF_MSG_PIDR] = true;
+            
+            /* 7. Pre-write FMT+FMTU for PIDP */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_PIDP, sizeof(dataflash_pid_msg_t),
+                "PIDP", "QffffffffffB", "TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_PIDP, "s----------", "F----------");
+            s_bbox.encoder.format_written[DF_MSG_PIDP] = true;
+            
+            /* 8. Pre-write FMT+FMTU for PIDY */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_PIDY, sizeof(dataflash_pid_msg_t),
+                "PIDY", "QffffffffffB", "TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_PIDY, "s----------", "F----------");
+            s_bbox.encoder.format_written[DF_MSG_PIDY] = true;
+            
+            /* 9. Pre-write FMT+FMTU for PIDA */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_PIDA, sizeof(dataflash_pid_msg_t),
+                "PIDA", "QffffffffffB", "TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_PIDA, "s----------", "F----------");
+            s_bbox.encoder.format_written[DF_MSG_PIDA] = true;
+            
+            /* 10. Pre-write FMT+FMTU for PARM (required by PID Review tool) */
+            offset += bbox_encode_dataflash_fmt(
+                header_buf + offset, DF_MSG_PARM, sizeof(dataflash_parm_msg_t),
+                "PARM", "QNff", "TimeUS,Name,Value,Default");
+            offset += bbox_encode_dataflash_fmtu(
+                header_buf + offset, timestamp, DF_MSG_PARM, "s---", "F---");
+            s_bbox.encoder.format_written[DF_MSG_PARM] = true;
+            
+            /* 11. Write PARM data messages with default Copter PID parameters */
+            /* Roll rate PID parameters */
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_RLL_P", 0.135f, 0.135f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_RLL_I", 0.135f, 0.135f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_RLL_D", 0.0036f, 0.0036f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_RLL_FF", 0.0f, 0.0f);
+            /* Pitch rate PID parameters */
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_PIT_P", 0.135f, 0.135f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_PIT_I", 0.135f, 0.135f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_PIT_D", 0.0036f, 0.0036f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_PIT_FF", 0.0f, 0.0f);
+            /* Yaw rate PID parameters */
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_YAW_P", 0.18f, 0.18f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_YAW_I", 0.018f, 0.018f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_YAW_D", 0.0f, 0.0f);
+            offset += bbox_encode_dataflash_parm(header_buf + offset, sizeof(header_buf) - offset, timestamp, "ATC_RAT_YAW_FF", 0.0f, 0.0f);
             
             header_size = offset;
             break;
@@ -758,8 +808,7 @@ static bbox_err_t write_file_header(void)
                 s_bbox.current_file_size += written;
                 s_bbox.stats.bytes_written += header_size + sizeof(s_bbox.iv);
                 
-                /* Reset encoder for new file */
-                bbox_encoder_init(&s_bbox.encoder, s_bbox.config.log_format);
+                /* Note: Don't reset encoder here - format_written flags are set in header */
                 
                 return BBOX_OK;
             }
@@ -776,8 +825,11 @@ static bbox_err_t write_file_header(void)
     s_bbox.current_file_size += written;
     s_bbox.stats.bytes_written += written;
     
-    /* Reset encoder for new file */
-    bbox_encoder_init(&s_bbox.encoder, s_bbox.config.log_format);
+    /* Note: Don't reset encoder here for ArduPilot - format_written flags are set in header */
+    /* Only reset for BBOX format */
+    if (s_bbox.config.log_format == BBOX_FORMAT_BBOX) {
+        bbox_encoder_init(&s_bbox.encoder, s_bbox.config.log_format);
+    }
     
     return BBOX_OK;
 }

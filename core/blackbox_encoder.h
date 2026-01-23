@@ -66,7 +66,7 @@ typedef struct __attribute__((packed)) {
 
 typedef enum {
     DF_MSG_FORMAT   = 0x80,  /* Must be 128 */
-    DF_MSG_FMTU     = 0x76,  /* Format Units - required for Mission Planner */
+    DF_MSG_FMTU     = 0x76,  /* Format Units - required for Mission Planner (118) */
     DF_MSG_PARM     = 0x20,  /* Parameters */
     DF_MSG_GPS      = 0x21,
     DF_MSG_IMU      = 0x22,
@@ -75,13 +75,14 @@ typedef enum {
     DF_MSG_RCOU     = 0x25,  /* RC output */
     DF_MSG_BARO     = 0x26,
     DF_MSG_CURR     = 0x27,
-    DF_MSG_ATT      = 0x28,  /* Attitude */
+    DF_MSG_ATT      = 0x48,  /* Attitude - matches ArduPilot (72) */
     DF_MSG_MAG      = 0x29,
     DF_MSG_MODE     = 0x2A,
-    DF_MSG_PIDR     = 0x2B,  /* PID Roll */
-    DF_MSG_PIDP     = 0x2C,  /* PID Pitch */
-    DF_MSG_PIDY     = 0x2D,  /* PID Yaw */
-    DF_MSG_PIDA     = 0x2E,  /* PID Altitude */
+    DF_MSG_PIDR     = 0x69,  /* PID Roll (105) - matches ArduPilot */
+    DF_MSG_PIDP     = 0x6A,  /* PID Pitch (106) - matches ArduPilot */
+    DF_MSG_PIDY     = 0x6B,  /* PID Yaw (107) - matches ArduPilot */
+    DF_MSG_PIDA     = 0x6C,  /* PID Altitude (108) - matches ArduPilot */
+    DF_MSG_PIDS     = 0x6D,  /* PID Steer (109) - matches ArduPilot */
     DF_MSG_MOT      = 0x2F,
     DF_MSG_ESC      = 0x30,
     DF_MSG_BAT      = 0x31,
@@ -136,16 +137,19 @@ typedef struct __attribute__((packed)) {
 
 /**
  * @brief ArduPilot ATT message structure
+/**
+ * @brief ArduPilot ATT message structure - matches ArduPilot format for PID Review tool
  */
 typedef struct __attribute__((packed)) {
     dataflash_msg_header_t header;
     uint64_t timestamp_us;
-    int16_t roll_cd;      /* centi-degrees */
-    int16_t pitch_cd;
-    uint16_t yaw_cd;
-    int16_t roll_err_cd;
-    int16_t pitch_err_cd;
-    int16_t yaw_err_cd;
+    float des_roll;       /* Desired roll in degrees */
+    float roll;           /* Actual roll in degrees */
+    float des_pitch;      /* Desired pitch in degrees */
+    float pitch;          /* Actual pitch in degrees */
+    float des_yaw;        /* Desired yaw in degrees */
+    float yaw;            /* Actual yaw in degrees */
+    uint8_t aekf;         /* Active EKF */
 } dataflash_att_msg_t;
 
 /**
@@ -163,6 +167,18 @@ typedef struct __attribute__((packed)) {
     uint8_t instance;
     float temperature;
 } dataflash_imu_msg_t;
+
+/**
+ * @brief ArduPilot PARM message structure
+ * Required for PID Review tool to find PID parameters
+ */
+typedef struct __attribute__((packed)) {
+    dataflash_msg_header_t header;
+    uint64_t timestamp_us;
+    char name[16];        /* Parameter name (N format = 16 chars) */
+    float value;          /* Parameter value */
+    float default_value;  /* Default value */
+} dataflash_parm_msg_t;
 
 /*******************************************************************************
  * Encoder Context
@@ -447,18 +463,18 @@ static inline size_t bbox_encode_dataflash_pid(
 }
 
 /**
- * @brief Encode a DataFlash ATT message
+ * @brief Encode a DataFlash ATT message - matches ArduPilot format for PID Review tool
  */
 static inline size_t bbox_encode_dataflash_att(
     uint8_t *buffer,
     size_t buffer_size,
     uint64_t timestamp_us,
-    float roll_rad,
-    float pitch_rad,
-    float yaw_rad,
-    float rollspeed,
-    float pitchspeed,
-    float yawspeed)
+    float des_roll_deg,
+    float roll_deg,
+    float des_pitch_deg,
+    float pitch_deg,
+    float des_yaw_deg,
+    float yaw_deg)
 {
     if (buffer_size < sizeof(dataflash_att_msg_t)) {
         return 0;
@@ -470,15 +486,14 @@ static inline size_t bbox_encode_dataflash_att(
     msg->header.msg_id = DF_MSG_ATT;
     msg->timestamp_us = timestamp_us;
     
-    /* Convert radians to centi-degrees */
-    msg->roll_cd = (int16_t)(roll_rad * 5729.578f);  /* rad to cdeg */
-    msg->pitch_cd = (int16_t)(pitch_rad * 5729.578f);
-    msg->yaw_cd = (uint16_t)((yaw_rad < 0 ? yaw_rad + 6.283185f : yaw_rad) * 5729.578f);
-    
-    /* Error terms as rates for now */
-    msg->roll_err_cd = (int16_t)(rollspeed * 5729.578f);
-    msg->pitch_err_cd = (int16_t)(pitchspeed * 5729.578f);
-    msg->yaw_err_cd = (int16_t)(yawspeed * 5729.578f);
+    /* Store desired and actual values in degrees */
+    msg->des_roll = des_roll_deg;
+    msg->roll = roll_deg;
+    msg->des_pitch = des_pitch_deg;
+    msg->pitch = pitch_deg;
+    msg->des_yaw = des_yaw_deg;
+    msg->yaw = yaw_deg;
+    msg->aekf = 0;  /* Active EKF index */
     
     return sizeof(dataflash_att_msg_t);
 }
@@ -516,6 +531,38 @@ static inline size_t bbox_encode_dataflash_imu(
     return sizeof(dataflash_imu_msg_t);
 }
 
+/**
+ * @brief Encode a DataFlash PARM (parameter) message
+ * Required for PID Review tool to find PID parameters
+ */
+static inline size_t bbox_encode_dataflash_parm(
+    uint8_t *buffer,
+    size_t buffer_size,
+    uint64_t timestamp_us,
+    const char *param_name,
+    float value,
+    float default_value)
+{
+    if (buffer_size < sizeof(dataflash_parm_msg_t)) {
+        return 0;
+    }
+    
+    dataflash_parm_msg_t *msg = (dataflash_parm_msg_t *)buffer;
+    msg->header.head1 = DATAFLASH_HEAD_BYTE1;
+    msg->header.head2 = DATAFLASH_HEAD_BYTE2;
+    msg->header.msg_id = DF_MSG_PARM;
+    msg->timestamp_us = timestamp_us;
+    
+    /* Copy parameter name, pad with zeros */
+    memset(msg->name, 0, sizeof(msg->name));
+    strncpy(msg->name, param_name, sizeof(msg->name));
+    
+    msg->value = value;
+    msg->default_value = default_value;
+    
+    return sizeof(dataflash_parm_msg_t);
+}
+
 /*******************************************************************************
  * Format String Helpers
  ******************************************************************************/
@@ -547,8 +594,8 @@ static inline bool bbox_get_dataflash_fmt_info(
             
         case BBOX_MSG_ATTITUDE:
             *name = "ATT";
-            *format = "QccCccc";
-            *labels = "TimeUS,Roll,Pitch,Yaw,RollE,PitchE,YawE";
+            *format = "QffffffB";
+            *labels = "TimeUS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw,AEKF";
             *msg_type = DF_MSG_ATT;
             return true;
             
@@ -642,8 +689,9 @@ static inline bool bbox_get_dataflash_fmtu_info(
             return true;
             
         case DF_MSG_ATT:
-            *unit_ids = "sddd---";
-            *mult_ids = "F000---";
+            /* ATT: TimeUS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw,AEKF */
+            *unit_ids = "sdddddd-";
+            *mult_ids = "F000000-";
             return true;
             
         case DF_MSG_PIDR:

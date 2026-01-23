@@ -183,17 +183,18 @@ static void run_pid_and_log(float dt, uint8_t axis,
 
 /**
  * @brief Log attitude for context
+ * For ArduPilot PID Review tool: pass desired (target) and actual values
  */
 static void log_attitude(void)
 {
     bbox_msg_attitude_t att = {
         .timestamp_us = s_hal->get_time_us(),
-        .roll = s_state.roll,
-        .pitch = s_state.pitch,
-        .yaw = s_state.yaw,
-        .rollspeed = s_state.roll_rate,
-        .pitchspeed = s_state.pitch_rate,
-        .yawspeed = s_state.yaw_rate
+        .roll = s_state.roll,              /* Actual roll (used as Roll in ATT) */
+        .pitch = s_state.pitch,            /* Actual pitch */
+        .yaw = s_state.yaw_rate,           /* Using yaw_rate as yaw */
+        .rollspeed = s_state.roll_target,  /* Target roll (used as DesRoll in ATT) */
+        .pitchspeed = s_state.pitch_target, /* Target pitch (used as DesPitch) */
+        .yawspeed = s_state.yaw_rate_target /* Target yaw rate (used as DesYaw) */
     };
     bbox_log_attitude(&att);
 }
